@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # `labeled`/`unlabeled` so adding the `maintainer` label re-runs the checks
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+jobs:
+  tests:
+    name: simulator tests and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --locked
+
+      - name: Format and lint the simulator (group folders are checked by the next job)
+        run: |
+          FILES="src tests scripts demos main.py players/player0.py players/registry.py players/example_player.py"
+          uv run ruff format --check $FILES
+          uv run ruff check $FILES
+
+      # a virtual display, so the tests that open a window can run
+      - run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      - name: Tests
+        run: |
+          for t in test_enclosure test_invalid_examples test_players test_submissions test_limits test_runlog test_placement_guide; do
+            echo "::group::$t"
+            xvfb-run -a uv run python -m tests.$t
+            echo "::endgroup::"
+          done
+
+      # separate, and not blocking: window tests are the most likely to behave
+      # differently on a headless Linux machine than on a laptop
+      - name: GUI layout tests
+        continue-on-error: true
+        run: xvfb-run -a uv run python -m tests.test_gui_layout
+
+  submission:
+    name: group submission check
+    # a pull request that changes shared code (the maintainer's) gets the
+    # `maintainer` label, which skips this check
+    if: >-
+      github.event_name == 'pull_request' &&
+      !contains(github.event.pull_request.labels.*.name, 'maintainer')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the check compares against the base branch
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --locked
+      - name: Check the submission
+        run: uv run python -m scripts.check_submission --base origin/${{ github.base_ref }}

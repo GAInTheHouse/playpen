@@ -1,0 +1,39 @@
+{
+  "_description": "24 feasible (gate-length, wall-length) rectangle combinations exist, but only the two smallest (5x6 and 5x7) are small enough to fit in this tight 12x10 room -- every other combination has a side of 15+ units, too long to fit in a room with a ~15.6-unit diagonal. Player1 only tries its 10 biggest-area candidates before giving up, and the two that fit are ranked dead last (23rd/24th by area), so Player1 should return None. RandomPlayer samples length pairs and positions uniformly rather than ranking by area, so it has a real (and here, high) chance of stumbling onto one of the two small combinations and succeeding where Player1 doesn't.",
+  "room": [
+    [0, 0],
+    [12, 0],
+    [12, 10],
+    [0, 10]
+  ],
+  "inventory": {
+    "walls": {
+      "5": 1,
+      "15": 1,
+      "16": 1,
+      "17": 1,
+      "6": 1,
+      "7": 1,
+      "18": 2,
+      "19": 2,
+      "20": 2,
+      "21": 2
+    },
+    "gates": {
+      "5": 1,
+      "15": 1,
+      "16": 1,
+      "17": 1
+    },
+    "connectors": {
+      "straight": 10,
+      "right": 20,
+      "diagonal": 10
+    }
+  },
+  "weights": {
+    "A": 2.0,
+    "C": -3.0,
+    "G": 100.0
+  }
+}

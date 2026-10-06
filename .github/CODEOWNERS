@@ -1,0 +1,13 @@
+# Who GitHub asks to review a pull request that touches each group's folder.
+# Fill in each group's usernames or team, and remove the leading "# ".
+# (Turn on "Require review from Code Owners" in the branch protection rules
+# if you want the group's own review to be required -- see MAINTAINERS.md.)
+#
+# /players/player1/            @your-org/group-1
+# /scenarios/players/player1/  @your-org/group-1
+# /players/player2/            @your-org/group-2
+# /scenarios/players/player2/  @your-org/group-2
+# ... and so on up to group 10
+#
+# Everything else (the simulator itself) is yours, so every change to it asks you:
+# *                            @your-github-username

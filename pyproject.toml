@@ -1,0 +1,14 @@
+[project]
+name = "playpen"
+version = "0.1.0"
+description = "Simulator for COMS 4444 Project 2: Playpen"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "shapely>=2.1.1",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.13",
+]
