@@ -33,9 +33,9 @@
       "8": 1
     },
     "connectors": {
-      "straight": 8,
-      "right": 12,
-      "diagonal": 8 
+      "straight": 12,
+      "right": 16,
+      "diagonal": 12 
     }
   },
   "weights": {
