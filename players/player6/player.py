@@ -4,8 +4,10 @@ from shapely import Polygon
 
 from players.player0 import Player
 from src.enclosure import Construction
-from src.pieces import ConnectorType
+from src.pieces import Connector, ConnectorType, Piece, PieceType
 
+from players.player6.polygon import find_fit
+import math
 
 class Player6(Player):
     """Group 6: <one line on your strategy -- fill this in>."""
@@ -37,7 +39,7 @@ class Player6(Player):
         turns[i] is the turn after edges[i], including the closing joint."""
 
         def __init__(
-                self, edges: list["Player6.Edge"], turns: list[int], vertices: list[tuple[int, int]]
+                self, edges: list["Player6.Edge"], turns: list[int], vertices: list[tuple[float, float]]
         ) -> None:
             self.edges = edges.copy()
             self.turns = turns.copy()
@@ -45,7 +47,10 @@ class Player6(Player):
 
         def __str__(self) -> str:
             edges_text: str = ", ".join(str(edge) for edge in self.edges)
-            return f"Shape{{edges=[{edges_text}], turns={self.turns}, vertices={self.vertices}"
+            return f"Shape{{edges=[{edges_text}], turns={self.turns}, vertices={self.vertices}}}"
+
+        def to_polygon(self) -> Polygon:
+            return Polygon(self.vertices)
 
     class Materials:
         """Track remaining piece counts, connector counts, and total piece length."""
@@ -108,7 +113,7 @@ class Player6(Player):
             )
 
     @staticmethod
-    def is_simple_polygon(vertices: list[tuple[int, int]]) -> bool:
+    def is_simple_polygon(vertices: list[tuple[float, float]]) -> bool:
         """Require explicit closure and reject self-intersections, overlapping
         edges, and zero-area polygons. Concave polygons are allowed."""
         if len(vertices) < 4:
@@ -163,7 +168,7 @@ class Player6(Player):
 
     @staticmethod
     def generate_shapes(
-            materials: Materials, edge_options: list[Edge], max_faces: int
+            materials: Materials, edge_options: list[Edge], max_faces: int, max_shapes: int
     ) -> list[Shape]:
         """Enumerate closed orthogonal polygons using left and right 90-degree
         turns. Enforce inventory limits, at least one gate, and polygon validity."""
@@ -190,7 +195,7 @@ class Player6(Player):
                 total_turn,
                 remaining: Player6.Materials
         ) -> None:
-            if len(edges) >= max_faces:
+            if len(edges) >= max_faces or len(shapes) >= max_shapes:
                 return
             for edge in edge_options:
                 if not remaining.can_supply(edge):
@@ -277,7 +282,7 @@ class Player6(Player):
         )
         return shapes
 
-    def find_candidates(self) -> list[Shape]:
+    def find_candidates(self, max_shapes=10) -> list[Shape]:
         """Build the material inventory, enumerate straight-face options, and
         combine them into candidate shapes before room placement."""
 
@@ -305,7 +310,7 @@ class Player6(Player):
 
         # Build shapes
         shape_options: list[Player6.Shape] = Player6.generate_shapes(
-            materials=materials, edge_options=edge_options, max_faces=6
+            materials=materials, edge_options=edge_options, max_faces=6, max_shapes=max_shapes
         )
         for (shape_index, shape) in enumerate(shape_options):
             print(f"[{shape_index}]: {shape}")
@@ -332,6 +337,53 @@ class Player6(Player):
         #
         # PLACEMENT_GUIDE.md covers placing a shape in the room; SIMULATOR_GUIDE.md
         # covers everything else; players/example_player.py is a worked example.
-        self.find_candidates()
+        candidates = self.find_candidates()
 
-        return None
+        best_candidate = None
+        best_fit = None
+        best_score = 0
+        for c in candidates:
+            P = c.to_polygon()
+            fit = find_fit(self.room.polygon, P)
+            if fit is not None:
+                score = self.weights.A * P.area + self.weights.C * P.length
+                if score > best_score:
+                    best_score = score
+                    best_candidate = c
+                    best_fit = fit
+
+        if best_score <= 0:
+            return None
+
+        fit, params = best_fit
+
+        coords = list(fit.exterior.coords)
+        (x1, y1), (x2, y2) = coords[0], coords[1]
+
+        angle_rad = math.atan2(y2 - y1, x2 - x1)
+        angle_deg = math.degrees(angle_rad)
+
+        pieces = []
+        connectors = []
+        for e, t in zip(best_candidate.edges, best_candidate.turns):
+            for piece in e.pieces:
+                piece_type = PieceType.GATE if piece[0] == 0 else PieceType.WALL
+                pieces.append(Piece(piece_type=piece_type, length=piece[1]))
+            for _ in range(e.straight_count):
+                connectors.append(Connector(connector_type=ConnectorType.STRAIGHT))
+
+            if t == 90:
+                connectors.append(Connector(connector_type=ConnectorType.RIGHT))
+            elif t == -90:
+                connectors.append(Connector(connector_type=ConnectorType.RIGHT, reflex=False))
+            elif t == 45:
+                connectors.append(Connector(connector_type=ConnectorType.DIAGONAL))
+            elif t == -45:
+                connectors.append(Connector(connector_type=ConnectorType.DIAGONAL, reflex=True))
+        
+        return Construction(
+            start=(x1, y1),
+            start_heading=angle_deg,
+            pieces=pieces,
+            connectors=connectors
+        )
