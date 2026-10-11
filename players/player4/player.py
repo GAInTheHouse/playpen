@@ -3,6 +3,45 @@ STRATEGY: face-level geometric beam search, with a safe rectangle fallback.
 
 Search constants marked EMPIRICAL are hyperparameters currently based on vibes,
 need empirical testing 
+
+pre-work: we represent positions as a 4-tuple (x1, x2, y1, y2) as the only 
+possible vertices are (x1 + x2 sqrt(2)/2, y1 + y2 sqrt(2)/2) per tony
+
+1. we try to find the best rectangle as a fallback, in case our beam search 
+takes too long
+2. we beam search over faces, starting from empty config. the state is encoded 
+by the lengths, turns, vertices currently traversed (aka current path), and 
+some other helper derived characteristics that will help with pruning, 
+like the turn sum)
+3. we generate all possible children faces (next length, connector turn)
+4. we prune the child immediately if it cannot satisfy things like no 
+self-intersection, no longer able to return to origin, turns no longer 
+feasible, we can't satisfy it using curr inventory etc.
+5. we rank the surviving children based on a heuristic & retain top 110 (vibes-assigned num)
+
+h(s, r) = min(b(s), r) + w_d * d(s) + w_t * t(s) + w_p * p(s) 
+
+where 
+
+- s = current partial polygon state 
+- r = room area
+- b(s) = area of the smallest rectangle containing the partial polygon, a
+proxy of the current area 
+- d(s) = distance from current endpoint to origin (we want to favor points closer to the origin) 
+- t(s) = degree of turns currently used in (in 45º increments) per andrew 
+- p(s) = current perimeter 
+
+next steps: the w_i's are set by vibes. would be good to tie this in with the real weights 
+
+6. a leaf node is reached based on a successful polygon
+7. kill leaves if they're infeasible (prev impossibility constraints were
+necessary not sufficient, otw we risk exploring many physically different
+implementations of the same inventory) 
+8. we run this search for 35 cpu seconds and end up with a list of leaf 
+nodes. we check if any of these can be placed inside the room by doing 
+things like aligning face directions with room edges, rotating, etc.
+9. we pick the highest-scoring feasible polygon
+
 """
 
 from __future__ import annotations
