@@ -1,7 +1,8 @@
-"""Group 4: face-level geometric beam search, with a safe rectangle fallback.
+"""
+STRATEGY: face-level geometric beam search, with a safe rectangle fallback.
 
-Only this file needs to be copied into players/player4/player.py.  Search constants
-marked EMPIRICAL are intentionally initial guesses, not validated optimal values.
+Search constants marked EMPIRICAL are hyperparameters currently based on vibes,
+need empirical testing 
 """
 
 from __future__ import annotations
