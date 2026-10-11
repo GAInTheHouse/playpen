@@ -1,16 +1,17 @@
+import math
 from collections import Counter
 
 from shapely import Polygon
 
 from players.player0 import Player
-from src.enclosure import Construction
+from players.player6.polygon import find_fit
+from src.enclosure import Construction, score_construction, validate_construction
 from src.pieces import Connector, ConnectorType, Piece, PieceType
 
-from players.player6.polygon import find_fit
-import math
 
 class Player6(Player):
     """Group 6: <one line on your strategy -- fill this in>."""
+
     GATE = 0
     WALL = 1
     STEPS = (
@@ -39,7 +40,10 @@ class Player6(Player):
         turns[i] is the turn after edges[i], including the closing joint."""
 
         def __init__(
-                self, edges: list["Player6.Edge"], turns: list[int], vertices: list[tuple[float, float]]
+                self,
+                edges: list["Player6.Edge"],
+                turns: list[int],
+                vertices: list[tuple[float, float]],
         ) -> None:
             self.edges = edges.copy()
             self.turns = turns.copy()
@@ -52,10 +56,43 @@ class Player6(Player):
         def to_polygon(self) -> Polygon:
             return Polygon(self.vertices)
 
+        def to_construction(
+                self, start: tuple[float, float], start_heading: float
+        ) -> Construction:
+            """Expand faces into pieces and convert outgoing turns to vertex turns."""
+            pieces = []
+            outgoing_connectors = []
+            for edge, turn in zip(self.edges, self.turns):
+                for index, (kind, length) in enumerate(edge.pieces):
+                    piece_type = (
+                        PieceType.GATE if kind == Player6.GATE else PieceType.WALL
+                    )
+                    pieces.append(Piece(piece_type, length))
+                    if index < len(edge.pieces) - 1:
+                        outgoing_connectors.append(Connector(ConnectorType.STRAIGHT))
+                    else:
+                        if abs(turn) == 90:
+                            connector_type = ConnectorType.RIGHT
+                        elif abs(turn) == 45:
+                            connector_type = ConnectorType.DIAGONAL
+                        else:
+                            raise ValueError(f"Unsupported corner turn: {turn}")
+                        # A reflex connector turns right (-90 or -45 degrees).
+                        outgoing_connectors.append(
+                            Connector(connector_type, reflex=turn < 0)
+                        )
+
+            # Our turns follow each piece; Construction.connectors[i] precedes
+            # piece i. The final outgoing turn belongs at the starting vertex.
+            connectors = outgoing_connectors[-1:] + outgoing_connectors[:-1]
+            return Construction(start, start_heading, pieces, connectors)
+
     class Materials:
         """Track remaining piece counts, connector counts, and total piece length."""
 
-        def __init__(self, materials: list[list[int]], right_count: int, straight_count: int) -> None:
+        def __init__(
+                self, materials: list[list[int]], right_count: int, straight_count: int
+        ) -> None:
             self.materials = materials
             self.total_piece_length = 0
             for material in materials:
@@ -81,10 +118,7 @@ class Player6(Player):
             for material_type, material_length, material_count in self.materials:
                 available[(material_type, material_length)] += material_count
 
-            return all(
-                available[key] >= count
-                for key, count in needed.items()
-            )
+            return all(available[key] >= count for key, count in needed.items())
 
         def consume(self, edge: "Player6.Edge") -> None:
             """Deduct the pieces and straight connectors used by one edge.
@@ -137,7 +171,7 @@ class Player6(Player):
                         Player6.Edge(
                             pieces=selected.copy(),
                             length=total_length,
-                            straight_count=len(selected) - 1
+                            straight_count=len(selected) - 1,
                         )
                     )
                 return
@@ -152,14 +186,14 @@ class Player6(Player):
             max_count: int = min(
                 material_count,
                 (30 - total_length) // material_length,
-                materials.straight_count + 1 - len(selected)
+                materials.straight_count + 1 - len(selected),
             )
 
             for count in range(max_count + 1):
                 dfs(
                     index=(index + 1),
                     selected=(selected + [(material_type, material_length)] * count),
-                    total_length=(total_length + count * material_length)
+                    total_length=(total_length + count * material_length),
                 )
 
         dfs(index=0, selected=[], total_length=0)
@@ -180,10 +214,7 @@ class Player6(Player):
         def cannot_return_to_origin(position, remaining: Player6.Materials, edges_left):
             x, y = position
             minimum_distance = abs(x) + abs(y)
-            maximum_distance = min(
-                30 * edges_left,
-                remaining.total_piece_length
-            )
+            maximum_distance = min(30 * edges_left, remaining.total_piece_length)
             return minimum_distance > maximum_distance
 
         def dfs(
@@ -193,11 +224,13 @@ class Player6(Player):
                 turns,
                 vertices,
                 total_turn,
-                remaining: Player6.Materials
+                remaining: Player6.Materials,
         ) -> None:
             if len(edges) >= max_faces or len(shapes) >= max_shapes:
                 return
             for edge in edge_options:
+                if len(shapes) >= max_shapes:
+                    return
                 if not remaining.can_supply(edge):
                     continue
 
@@ -207,7 +240,7 @@ class Player6(Player):
                 dx, dy = Player6.STEPS[heading]
                 next_position = (
                     position[0] + dx * edge.length,
-                    position[1] + dy * edge.length
+                    position[1] + dy * edge.length,
                 )
 
                 # Update remaining materials
@@ -221,6 +254,8 @@ class Player6(Player):
                 # Headings use quarter-turn units: +1 is left, -1 is right.
                 # Straight joins are already represented inside each Edge.
                 for turn in [1, -1]:
+                    if len(shapes) >= max_shapes:
+                        return
                     next_heading = (heading + turn) % 4
                     next_total_turn = total_turn + turn
                     next_turns = turns + [turn * 90]
@@ -232,10 +267,10 @@ class Player6(Player):
                             continue
                         if next_heading != 0:
                             continue
-                        # Degrees added up to a multiplier of 180
+                        # A simple polygon has total signed turning angle +/-360 degrees.
                         if abs(next_total_turn) != 4:
                             continue
-                        # No holes in the polygon
+                        # Reject self-intersections and degenerate polygons.
                         if not Player6.is_simple_polygon(next_vertices):
                             continue
                         # At least one gate
@@ -250,14 +285,12 @@ class Player6(Player):
                             Player6.Shape(
                                 edges=next_edges,
                                 turns=next_turns,
-                                vertices=next_vertices[:-1]
+                                vertices=next_vertices[:-1],
                             )
                         )
                     else:
                         if cannot_return_to_origin(
-                                next_position,
-                                next_remaining,
-                                max_faces - len(next_edges)
+                                next_position, next_remaining, max_faces - len(next_edges)
                         ):
                             continue
 
@@ -268,7 +301,7 @@ class Player6(Player):
                             turns=next_turns,
                             vertices=next_vertices,
                             total_turn=next_total_turn,
-                            remaining=next_remaining
+                            remaining=next_remaining,
                         )
 
         dfs(
@@ -278,7 +311,7 @@ class Player6(Player):
             turns=[],
             vertices=[(0, 0)],
             total_turn=0,
-            remaining=materials.clone()
+            remaining=materials.clone(),
         )
         return shapes
 
@@ -300,20 +333,21 @@ class Player6(Player):
             materials_core.append([Player6.GATE, gate, gate_count])
 
         materials: Player6.Materials = Player6.Materials(
-            materials=materials_core, straight_count=straight_count, right_count=right_count
+            materials=materials_core,
+            straight_count=straight_count,
+            right_count=right_count,
         )
 
         # Build edges first
         edge_options: list[Player6.Edge] = Player6.generate_edges(materials=materials)
-        for (edge_index, edge) in enumerate(edge_options):
-            print(f"[{edge_index}]: {edge}")
 
         # Build shapes
         shape_options: list[Player6.Shape] = Player6.generate_shapes(
-            materials=materials, edge_options=edge_options, max_faces=6, max_shapes=max_shapes
+            materials=materials,
+            edge_options=edge_options,
+            max_faces=6,
+            max_shapes=max_shapes,
         )
-        for (shape_index, shape) in enumerate(shape_options):
-            print(f"[{shape_index}]: {shape}")
 
         return shape_options
 
@@ -339,51 +373,31 @@ class Player6(Player):
         # covers everything else; players/example_player.py is a worked example.
         candidates = self.find_candidates()
 
-        best_candidate = None
-        best_fit = None
+        best_construction = None
         best_score = 0
         for c in candidates:
             P = c.to_polygon()
             fit = find_fit(self.room.polygon, P)
             if fit is not None:
-                score = self.weights.A * P.area + self.weights.C * P.length
+                _, (theta, tx, ty) = fit
+                # Use the rigid transform directly, preserving the candidate's
+                # first vertex and traversal direction rather than ring ordering.
+                angle = math.radians(theta)
+                x0, y0 = c.vertices[0]
+                x1, y1 = c.vertices[1]
+                start = (
+                    x0 * math.cos(angle) - y0 * math.sin(angle) + tx,
+                    x0 * math.sin(angle) + y0 * math.cos(angle) + ty,
+                )
+                heading = math.degrees(math.atan2(y1 - y0, x1 - x0)) + theta
+                construction = c.to_construction(start, heading)
+                result = validate_construction(construction, self.room, self.inventory)
+                if not result.valid:
+                    continue
+                # Include the baseline and second-gate bonus, exactly as the simulator does.
+                score = score_construction(result, self.weights)
                 if score > best_score:
                     best_score = score
-                    best_candidate = c
-                    best_fit = fit
+                    best_construction = construction
 
-        if best_score <= 0:
-            return None
-
-        fit, params = best_fit
-
-        coords = list(fit.exterior.coords)
-        (x1, y1), (x2, y2) = coords[0], coords[1]
-
-        angle_rad = math.atan2(y2 - y1, x2 - x1)
-        angle_deg = math.degrees(angle_rad)
-
-        pieces = []
-        connectors = []
-        for e, t in zip(best_candidate.edges, best_candidate.turns):
-            for piece in e.pieces:
-                piece_type = PieceType.GATE if piece[0] == 0 else PieceType.WALL
-                pieces.append(Piece(piece_type=piece_type, length=piece[1]))
-            for _ in range(e.straight_count):
-                connectors.append(Connector(connector_type=ConnectorType.STRAIGHT))
-
-            if t == 90:
-                connectors.append(Connector(connector_type=ConnectorType.RIGHT))
-            elif t == -90:
-                connectors.append(Connector(connector_type=ConnectorType.RIGHT, reflex=False))
-            elif t == 45:
-                connectors.append(Connector(connector_type=ConnectorType.DIAGONAL))
-            elif t == -45:
-                connectors.append(Connector(connector_type=ConnectorType.DIAGONAL, reflex=True))
-        
-        return Construction(
-            start=(x1, y1),
-            start_heading=angle_deg,
-            pieces=pieces,
-            connectors=connectors
-        )
+        return best_construction
