@@ -4,7 +4,7 @@ import math
 import signal
 import time
 from functools import lru_cache
-from itertools import product
+from itertools import chain, product, zip_longest
 
 from players.player0 import Player
 from shapely.geometry import Polygon
@@ -19,10 +19,10 @@ class Player2(Player):
 
     # Leave ample headroom under the simulator's default 300 CPU seconds.
     # Lower this when testing with a smaller --cpu-limit.
-    SEARCH_CPU_SECONDS = 15.0
+    SEARCH_CPU_SECONDS = 45.0
     ALLOCATION_NODE_LIMIT = 2000
     ALLOCATION_CPU_SECONDS = 0.04
-    PLACEMENT_CPU_SECONDS = 0.08
+    PLACEMENT_CPU_SECONDS = 0.03
     MAX_CANDIDATES_PER_FAMILY = 500
 
     def build_enclosure(self) -> Construction | None:
@@ -136,13 +136,28 @@ class Player2(Player):
         buffered_room = prep(room.buffer(TOL))
         corners = list(room.exterior.coords)[:-1]
         headings = set(range(0, 180, 15))
+        room_headings = set()
         for p, q in zip(corners, corners[1:] + corners[:1]):
             angle = math.degrees(math.atan2(q[1] - p[1], q[0] - p[0]))
             headings.add(round(angle % 180, 9))
             headings.add(round((angle + 90) % 180, 9))
+            room_headings.add(round(angle % 180, 9))
         centers = [(room.centroid.x, room.centroid.y)]
         inside = room.representative_point()
         centers.append((inside.x, inside.y))
+        # Test small offsets near the center before boundary anchors. Large
+        # shapes can fit between notches while failing at every room corner.
+        for dx, dy in ((0, -4), (0, 4)) + (
+            (0, -5),
+            (0, 5),
+            (-5, 0),
+            (5, 0),
+            (-5, -5),
+            (5, -5),
+            (-5, 5),
+            (5, 5),
+        ):
+            centers.append((room.centroid.x + dx, room.centroid.y + dy))
         minx, miny, maxx, maxy = room.bounds
         for i in range(1, 10):
             for j in range(1, 10):
@@ -150,19 +165,41 @@ class Player2(Player):
                     (minx + (maxx - minx) * i / 10, miny + (maxy - miny) * j / 10)
                 )
 
-        def placement(vertices):
+        def placement(vertices, hint=None):
             placement_deadline = min(
                 deadline, time.process_time() + self.PLACEMENT_CPU_SECONDS
             )
             local = Polygon(vertices)
             center = local.centroid
+            if hint is not None:
+                hint_center, hint_heading = hint
+                for delta in (0, -0.5, 0.5, -1, 1, -2, 2):
+                    heading = hint_heading + delta
+                    theta = math.radians(heading)
+                    co, si = math.cos(theta), math.sin(theta)
+                    offsets = [(x * co - y * si, x * si + y * co) for x, y in vertices]
+                    cx = center.x * co - center.y * si
+                    cy = center.x * si + center.y * co
+                    for dx, dy in product((0, -0.5, 0.5, -1, 1, -2, 2), repeat=2):
+                        if expired() or time.process_time() >= placement_deadline:
+                            return None
+                        x, y = hint_center[0] + dx - cx, hint_center[1] + dy - cy
+                        polygon = Polygon([(x + ox, y + oy) for ox, oy in offsets])
+                        if buffered_room.contains(polygon):
+                            return (x, y), heading
             # Non-symmetric templates need the full circle. Include alignment
             # of EVERY template edge with EVERY room edge, not just edge zero.
             angles = set(range(0, 360, 15))
             for heading in headings:
                 for offset in range(0, 360, 45):
                     angles.add(round((heading + offset) % 360, 9))
-            for heading in sorted(angles):
+            preferred = {
+                (heading + offset) % 360
+                for heading in room_headings
+                for offset in range(0, 360, 45)
+            }
+            ordered_angles = sorted(preferred) + sorted(angles - preferred)
+            for heading in ordered_angles:
                 if expired() or time.process_time() >= placement_deadline:
                     return None
                 theta = math.radians(heading)
@@ -170,10 +207,11 @@ class Player2(Player):
                 offsets = [(x * co - y * si, x * si + y * co) for x, y in vertices]
                 cx = center.x * co - center.y * si
                 cy = center.x * si + center.y * co
-                starts = [
+                starts = [(x - cx, y - cy) for x, y in centers[:10]]
+                starts.extend(
                     (px - ox, py - oy) for px, py in corners for ox, oy in offsets
-                ]
-                starts.extend((x - cx, y - cy) for x, y in centers)
+                )
+                starts.extend((x - cx, y - cy) for x, y in centers[10:])
                 for x, y in starts:
                     if expired() or time.process_time() >= placement_deadline:
                         return None
@@ -194,28 +232,43 @@ class Player2(Player):
             0.01, min(0.6, (deadline - time.process_time()) * 0.12)
         )
 
+        sampled_lengths = (
+            sorted(
+                {lengths[round(i * (len(lengths) - 1) / 4)] for i in range(5)},
+                reverse=True,
+            )
+            if lengths
+            else []
+        )
+
+        def parameter_tuples(dimensions):
+            # Cover the whole length range before the full enumeration.
+            # A timed lexicographic product otherwise spends nearly all its
+            # time with its first parameter fixed at the smallest length.
+            yield from chain(
+                product(sampled_lengths, repeat=dimensions),
+                product(reversed(lengths), repeat=dimensions),
+            )
+
         def templates():
             generators = []
             if right >= 4:
                 generators.append(
                     (
                         ("rectangle", (a, b, a, b))
-                        for a, b in product(lengths, repeat=2)
+                        for a, b in parameter_tuples(2)
                         if a <= b
                     )
                 )
             if right >= 2 and diagonal >= 4:
                 generators.append(
-                    (
-                        ("hexagon", (a, b, c, a, b, c))
-                        for a, b, c in product(lengths, repeat=3)
-                    )
+                    (("hexagon", (a, b, c, a, b, c)) for a, b, c in parameter_tuples(3))
                 )
             if diagonal >= 8:
                 generators.append(
                     (
                         ("octagon", (a, b, c, d, a, b, c, d))
-                        for a, b, c, d in product(lengths, repeat=4)
+                        for a, b, c, d in parameter_tuples(4)
                         if a <= c
                     )
                 )
@@ -223,7 +276,7 @@ class Player2(Player):
                 generators.append(
                     (
                         ("L-shape", (a + b, c, b, d, a, c + d))
-                        for a, b, c, d in product(lengths, repeat=4)
+                        for a, b, c, d in parameter_tuples(4)
                         if a + b in faces and c + d in faces
                     )
                 )
@@ -258,9 +311,13 @@ class Player2(Player):
         # Retain both high-scoring candidates and small fallback candidates.
         # This avoids spending the whole budget on large shapes that do not fit.
         grouped = {}
+        generated_seen = set()
         for candidate in candidates:
+            if (candidate[2], candidate[3]) in generated_seen:
+                continue
+            generated_seen.add((candidate[2], candidate[3]))
             grouped.setdefault(candidate[2], []).append(candidate)
-        fallback, narrow, improving = [], [], []
+        fallback, narrow, improving_groups = [], [], []
         for family, group in grouped.items():
             small = sorted(group, key=lambda candidate: sum(candidate[3]))[:12]
             fallback.extend(small)
@@ -270,39 +327,55 @@ class Player2(Player):
                 narrow.extend(
                     candidate for candidate in group if min(candidate[3]) <= 7
                 )
-            improving.extend(
-                sorted(group, reverse=True)[: self.MAX_CANDIDATES_PER_FAMILY]
+            top = sorted(group, reverse=True)[: self.MAX_CANDIDATES_PER_FAMILY]
+            diverse = sorted(
+                (
+                    candidate
+                    for candidate in group
+                    if family != "L-shape"
+                    and all(n in sampled_lengths for n in candidate[3])
+                ),
+                reverse=True,
             )
+            # Preserve broad sampled sizes instead of letting the largest
+            # (often unplaceable) 500 candidates eliminate smaller shapes.
+            family_queue = []
+            for index in range(max(len(top), len(diverse))):
+                if index < len(diverse):
+                    family_queue.append(diverse[index])
+                if index < len(top):
+                    family_queue.append(top[index])
+            improving_groups.append(family_queue)
         candidates = sorted(fallback, key=lambda candidate: sum(candidate[3]))[:4]
         candidates.extend(
             sorted(narrow, key=lambda candidate: (min(candidate[3]), -candidate[0]))
         )
         candidates.extend(sorted(fallback, key=lambda candidate: sum(candidate[3])))
-        candidates.extend(sorted(improving, reverse=True))
+        for batch in zip_longest(*improving_groups):
+            candidates.extend(candidate for candidate in batch if candidate is not None)
         seen = set()
 
         best_family = ""
         tried = 0
-        for upper_score, base, family, sides in candidates:
-            if expired():
-                break
-            if upper_score <= best_score or (family, sides) in seen:
-                continue
-            seen.add((family, sides))
+        best_sides = None
+        refinement_tried = 0
+
+        def evaluate(base, family, sides, hint=None):
+            nonlocal best, best_score, best_family, best_sides
             turns = self._template_turns(family)
             vertices = self._integer_vertices(sides, turns)
             if vertices is None:
-                continue
+                return False
             shape = Polygon(vertices)
             if not shape.is_valid or shape.area <= 0:
-                continue
+                return False
             # A shape's diameter cannot exceed the room bounding-box diagonal.
             if any(
                 math.hypot(x - xx, y - yy) > room_diagonal + TOL
                 for x, y in vertices
                 for xx, yy in vertices
             ):
-                continue
+                return False
             # Geometry is unchanged by the face assembly or choice of gates.
             assemblies = None
             if self.weights.G > 0:
@@ -310,7 +383,7 @@ class Player2(Player):
             if assemblies is None and base > best_score:
                 assemblies = allocate(sides, 1)
             if assemblies is None:
-                continue
+                return False
             bonus = (
                 sum(
                     any(types[i].is_gate and n for i, n in enumerate(face))
@@ -319,10 +392,10 @@ class Player2(Player):
                 >= 2
             )
             if base + (self.weights.G if bonus else 0) <= best_score:
-                continue
-            found = placement(vertices)
+                return False
+            found = placement(vertices, hint)
             if found is None:
-                continue
+                return False
             pieces, connectors = [], []
             for usage, turn in zip(assemblies, turns):
                 face = [piece for piece, n in zip(types, usage) for _ in range(n)]
@@ -345,16 +418,72 @@ class Player2(Player):
                 if score > best_score:
                     best, best_score = construction, score
                     best_family = family
-        timed_out = time.process_time() >= deadline
-        progress = f"tried {tried} of {len(candidates)} candidates"
+                    best_sides = sides
+                    print(f"Playpen: improved {family}, score {score:.2f}", flush=True)
+                    return True
+            return False
+
+        # Reserve time to improve the strongest feasible seed, rather than
+        # spending the whole run on unrelated template placements.
+        broad_deadline = started + budget * 0.4
+        for upper_score, base, family, sides in candidates:
+            if expired() or (
+                best is not None and time.process_time() >= broad_deadline
+            ):
+                break
+            if upper_score <= best_score or (family, sides) in seen:
+                continue
+            seen.add((family, sides))
+            tried += 1
+            evaluate(base, family, sides)
+
+        local_seen = set()
+        while best is not None and not expired():
+            family, seed = best_family, best_sides
+            parameters = self._parameters(family, seed)
+            neighbors = []
+            for changes in self._neighbor_changes(len(parameters)):
+                proposed = tuple(n + delta for n, delta in zip(parameters, changes))
+                sides = self._sides_from_parameters(family, proposed)
+                if (
+                    any(n not in faces for n in sides)
+                    or (family, sides) in local_seen
+                    or sides == seed
+                ):
+                    continue
+                vertices = self._integer_vertices(sides, self._template_turns(family))
+                if vertices is None:
+                    continue
+                area = Polygon(vertices).area
+                base = (
+                    BASELINE_SCORE + self.weights.A * area + self.weights.C * sum(sides)
+                )
+                if base + self.weights.G > best_score:
+                    neighbors.append((base + self.weights.G, base, sides))
+            neighbors.sort(reverse=True)
+            incumbent = validate_construction(best, self.room, self.inventory)
+            center = incumbent.polygon.centroid
+            hint = ((center.x, center.y), best.start_heading)
+            improved = False
+            for _, base, sides in neighbors:
+                if expired():
+                    break
+                local_seen.add((family, sides))
+                refinement_tried += 1
+                if evaluate(base, family, sides, hint):
+                    improved = True
+                    break  # Expand around the newly improved shape.
+            if not improved:
+                break
+
+        timed_out = expired()
+        progress = f"tried {tried} of {len(candidates)} candidates, {refinement_tried} local refinements"
         if best:
             self.note = f"Composite {best_family}; score {best_score:.2f} ({progress})."
         elif not candidates:
             self.note = "No candidate shape: connectors/pieces can't form any template."
         elif timed_out:
-            self.note = (
-                f"Timed out after {self.SEARCH_CPU_SECONDS:.0f}s: {progress}, none fit."
-            )
+            self.note = f"Search budget exhausted after {time.process_time() - started:.2f}s CPU: {progress}, none fit."
         else:
             self.note = (
                 f"Searched everything: {progress}; none could be built and placed."
@@ -416,3 +545,31 @@ class Player2(Player):
         if (axis_x, axis_y, diagonal_x, diagonal_y) != (0, 0, 0, 0):
             return None
         return vertices
+
+    @staticmethod
+    def _parameters(family, sides):
+        if family == "L-shape":
+            return (sides[4], sides[2], sides[1], sides[3])
+        return sides[: len(sides) // 2]
+
+    @staticmethod
+    def _sides_from_parameters(family, parameters):
+        if family == "L-shape":
+            a, b, c, d = parameters
+            return (a + b, c, b, d, a, c + d)
+        return parameters + parameters
+
+    @staticmethod
+    def _neighbor_changes(count):
+        # Integer moves preserve the opposite-side relationships exactly.
+        for index in range(count):
+            for amount in (-2, -1, 1, 2):
+                change = [0] * count
+                change[index] = amount
+                yield tuple(change)
+        for first in range(count):
+            for second in range(first + 1, count):
+                for a, b in product((-1, 1), repeat=2):
+                    change = [0] * count
+                    change[first], change[second] = a, b
+                    yield tuple(change)
