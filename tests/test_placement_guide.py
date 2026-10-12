@@ -201,7 +201,7 @@ def test_every_file_the_docs_mention_exists():
 
 def test_files_md_lists_every_file_in_the_repository():
     text = (PROJECT / "FILES.md").read_text()
-    skipped_dirs = {".venv", "__pycache__", ".ruff_cache", "logs", ".git"}
+    skipped_dirs = {".venv", "__pycache__", ".ruff_cache", ".idea", "logs", ".git"}
     unlisted = []
     for path in sorted(PROJECT.rglob("*")):
         relative = path.relative_to(PROJECT)
@@ -212,17 +212,20 @@ def test_files_md_lists_every_file_in_the_repository():
         ):
             continue
         shown = relative.as_posix()
-        # the ten group folders are documented once, as a range
-        shown = re.sub(
-            r"^(players|scenarios/players)/player\d+/", r"\1/player1/", shown
-        )
-        if shown.endswith("/.gitkeep"):
-            shown = shown[: -len(".gitkeep")]
+        # What is inside a group's folders is the group's business and changes
+        # all the time; it must never fail the maintainer's tests. The folders
+        # themselves are documented once, as a range (checked below).
+        if re.match(r"^(players|scenarios/players)/player\d+/", shown):
+            continue
         if shown not in text:
             unlisted.append(shown)
-    assert not unlisted, "FILES.md does not mention: " + ", ".join(
-        sorted(set(unlisted))
-    )
+    assert not unlisted, "FILES.md does not mention: " + ", ".join(sorted(unlisted))
+
+
+def test_files_md_documents_the_group_folders():
+    text = (PROJECT / "FILES.md").read_text()
+    assert "players/player1/player.py" in text
+    assert "scenarios/players/player1/" in text
 
 
 ALL_TESTS = [v for k, v in list(globals().items()) if k.startswith("test_")]

@@ -121,14 +121,21 @@ git-ignored.
   it, and the hover tooltip for a ghosted connector says `not in inventory`.
   If a construction needs two 13-unit walls and only one is in stock, the
   second is the ghost.
-- The right panel shows the room size, the enclosure's area and circumference,
-  each wall/gate placed, and the **score calculation**: baseline, area term,
+- The right panel shows the room size, a small **scrollable inventory box**, the
+  enclosure's area and circumference, each wall/gate placed, and the **score calculation**: baseline, area term,
   perimeter term and second-gate bonus, added up to the score. An invalid
   enclosure shows the -1000 penalty instead; no solution shows why 0 is the
   safe choice. The terms come from `explain_score` in `src/enclosure.py`, the
-  same function that produces the real score.
+  same function that produces the real score. **A negative score is shown in red,
+  on a red band.**
+- The inventory box lists every wall length, gate length and connector type, with
+  how many there are. Once an enclosure is built, the rows it **uses are
+  highlighted** (`using 2`), and the box scrolls to the first one. A row the
+  enclosure wants more of than the inventory has (or an item that isn't in the
+  inventory at all) is red, with how many it is short.
 - The window is sized to fit your screen and everything is laid out from its
-  actual size, so it can be resized.
+  actual size, so it can be resized. On a screen too short for the whole panel,
+  the panel scrolls with the mouse wheel instead of cutting anything off.
 
 ## The rules, as implemented
 
@@ -254,6 +261,7 @@ uv run python -m tests.test_submissions        # group players, the submission c
 uv run python -m tests.test_placement_guide    # the docs: PLACEMENT_GUIDE.md's code runs, files mentioned exist
 uv run python -m tests.test_runlog             # run logs, and the main.py command line
 uv run python -m tests.test_gui_layout         # GUI layout (needs a display)
+uv run python -m tests.test_gui_inventory      # the inventory box, red negative score (needs a display)
 ```
 
 ## Code Quality and Formatting
