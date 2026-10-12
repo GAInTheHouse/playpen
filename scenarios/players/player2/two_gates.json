@@ -1,0 +1,22 @@
+{
+  "room": [
+    [0, 0],
+    [5, 0],
+    [5, 5],
+    [0, 5]
+  ],
+  "inventory": {
+    "walls": {"5": 3},
+    "gates": {"5": 2},
+    "connectors": {
+      "straight": 0,
+      "right": 4,
+      "diagonal": 0
+    }
+  },
+  "weights": {
+    "A": 1.0,
+    "C": -100.0,
+    "G": 980.0
+  }
+}
