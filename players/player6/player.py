@@ -26,7 +26,7 @@ class Player6(Player):
         and gates using straight connectors."""
 
         def __init__(
-                self, pieces: list[tuple[int, int]], length: int, straight_count: int
+            self, pieces: list[tuple[int, int]], length: int, straight_count: int
         ) -> None:
             self.pieces = pieces.copy()
             self.length = length
@@ -40,10 +40,10 @@ class Player6(Player):
         turns[i] is the turn after edges[i], including the closing joint."""
 
         def __init__(
-                self,
-                edges: list["Player6.Edge"],
-                turns: list[int],
-                vertices: list[tuple[float, float]],
+            self,
+            edges: list["Player6.Edge"],
+            turns: list[int],
+            vertices: list[tuple[float, float]],
         ) -> None:
             self.edges = edges.copy()
             self.turns = turns.copy()
@@ -57,7 +57,7 @@ class Player6(Player):
             return Polygon(self.vertices)
 
         def to_construction(
-                self, start: tuple[float, float], start_heading: float
+            self, start: tuple[float, float], start_heading: float
         ) -> Construction:
             """Expand faces into pieces and convert outgoing turns to vertex turns."""
             pieces = []
@@ -91,7 +91,7 @@ class Player6(Player):
         """Track remaining piece counts, connector counts, and total piece length."""
 
         def __init__(
-                self, materials: list[list[int]], right_count: int, straight_count: int
+            self, materials: list[list[int]], right_count: int, straight_count: int
         ) -> None:
             self.materials = materials
             self.total_piece_length = 0
@@ -202,7 +202,7 @@ class Player6(Player):
 
     @staticmethod
     def generate_shapes(
-            materials: Materials, edge_options: list[Edge], max_faces: int, max_shapes: int
+        materials: Materials, edge_options: list[Edge], max_faces: int, max_shapes: int
     ) -> list[Shape]:
         """Enumerate closed orthogonal polygons using left and right 90-degree
         turns. Enforce inventory limits, at least one gate, and polygon validity."""
@@ -218,13 +218,13 @@ class Player6(Player):
             return minimum_distance > maximum_distance
 
         def dfs(
-                position,
-                heading,
-                edges,
-                turns,
-                vertices,
-                total_turn,
-                remaining: Player6.Materials,
+            position,
+            heading,
+            edges,
+            turns,
+            vertices,
+            total_turn,
+            remaining: Player6.Materials,
         ) -> None:
             if len(edges) >= max_faces or len(shapes) >= max_shapes:
                 return
@@ -275,9 +275,9 @@ class Player6(Player):
                             continue
                         # At least one gate
                         if not any(
-                                piece_type == Player6.GATE
-                                for edge in next_edges
-                                for piece_type, _ in edge.pieces
+                            piece_type == Player6.GATE
+                            for edge in next_edges
+                            for piece_type, _ in edge.pieces
                         ):
                             continue
 
@@ -290,7 +290,7 @@ class Player6(Player):
                         )
                     else:
                         if cannot_return_to_origin(
-                                next_position, next_remaining, max_faces - len(next_edges)
+                            next_position, next_remaining, max_faces - len(next_edges)
                         ):
                             continue
 
@@ -341,15 +341,23 @@ class Player6(Player):
         # Build edges first
         edge_options: list[Player6.Edge] = Player6.generate_edges(materials=materials)
 
-        # Build shapes
+        # Reserve two slots for rectangles, which may fit narrow rooms even
+        # when the first concave candidates cannot. Keep the total limit.
+        rectangle_count = min(2, max_shapes)
+        rectangles = Player6.generate_shapes(
+            materials=materials,
+            edge_options=edge_options,
+            max_faces=4,
+            max_shapes=rectangle_count,
+        )
         shape_options: list[Player6.Shape] = Player6.generate_shapes(
             materials=materials,
             edge_options=edge_options,
             max_faces=6,
-            max_shapes=max_shapes,
+            max_shapes=max_shapes - len(rectangles),
         )
 
-        return shape_options
+        return rectangles + shape_options
 
     def build_enclosure(self) -> Construction | None:
         # Set up for you by Player.__init__:
