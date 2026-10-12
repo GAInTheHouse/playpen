@@ -75,7 +75,29 @@ Nothing here is a group's to change; everything a group's player is judged by li
 | `players/player0.py` | The base class `Player` every player subclasses: it stores `room`, `inventory`, `weights`, offers `note` and `lacks_connectors`, and requires `build_enclosure`. This is the contract. |
 | `players/registry.py` | Turns `--player <name>` into a class. Group players are found by naming convention (`players/playerN/player.py` defines `PlayerN`), so no group edits this file, and they are loaded only when selected. Also lists the demo and example players. |
 | `players/example_player.py` | **The one worked example** (`--player e`): finds a rectangle the inventory can build, then searches for where it fits. |
-| `players/player1/player.py` ... `player10/player.py` | One folder per group, each with an empty `PlayerN` for the group to fill in. A group changes only its own folder; the folder name and class name must stay. |
+| `players/player1/player.py` ... `player10/player.py` | One folder per group, each defining its `PlayerN` implementation. A group changes only its own folder; the folder name and class name must stay. |
+
+### Group-specific file inventory
+
+The tables below use the same canonical naming as the inventory test:
+`player1` in the File column stands for any group folder. The Groups column
+identifies the actual folders containing that filename; a row does not imply
+that every group has the file. Paths in these tables are inventory keys.
+
+| File | Groups | What it is |
+| :-- | :-- | :-- |
+| players/player1/README.md | 5 | Player usage, search behavior, and benchmark commands. |
+| players/player1/assign.py | 10 | Assign inventory pieces to shape faces. |
+| players/player1/benchmark.py | 5 | Run the player across scenarios and record results. |
+| players/player1/elapsed_time_evaluation.md | 5 | Historical elapsed-time benchmark results. |
+| players/player1/faces.py | 4 | Enumerate buildable straight faces. |
+| players/player1/heuristic_evaluation.md | 5 | Historical pruning comparison results. |
+| players/player1/lattice.py | 4 | Represent coordinates for headings in multiples of 45 degrees. |
+| players/player1/placement.py | 10 | Search for a shape placement inside the room. |
+| players/player1/polygon.py | 6 | Search for a closed loop of faces. |
+| players/player1/search.py | 4 | Search candidate enclosures. |
+| players/player1/shapes.py | 10 | Define candidate shape families. |
+| players/player1/test_search.py | 5 | Player search correctness and deadline tests. |
 
 ## `demos/`
 
@@ -93,7 +115,53 @@ A scenario is a JSON file: `room` (polygon corners), `inventory`, `weights`.
 | `scenarios/l_shaped_room.json` | A non-convex L-shaped room with a scarcer inventory. |
 | `scenarios/limits_tight_room_favors_small_shape.json` | A tight room where only the smallest of many possible rectangles fits; it caught a real bug in the example player's shape ranking. |
 | `scenarios/invalid_examples.json` | The room and inventory the invalid-enclosure demo is built around (an L-shaped room, plus the odd pieces its examples need). |
-| `scenarios/players/player1/` ... `player10/` | One folder per group for its own test scenarios. Each holds a `.gitkeep` so git keeps the empty folder. |
+| `scenarios/players/player1/` ... `player10/` | One folder per group for its own test scenarios. The `.gitkeep` files preserve empty folders; groups also add JSON scenarios. |
+
+### Group scenario inventory
+
+Canonical paths and group numbers follow the convention above.
+
+| File | Groups | What it is |
+| :-- | :-- | :-- |
+| scenarios/players/player1/32_edge_concave_room.json | 9 | Group test scenario. |
+| scenarios/players/player1/B.json | 1 | Group test scenario. |
+| scenarios/players/player1/angled_room.json | 5 | Group test scenario. |
+| scenarios/players/player1/coms4444.json | 1 | Group test scenario. |
+| scenarios/players/player1/cool.json | 2 | Group test scenario. |
+| scenarios/players/player1/cross_gate_bonus.json | 6 | Group test scenario. |
+| scenarios/players/player1/cross_rotated_30.json | 6 | Group test scenario. |
+| scenarios/players/player1/crown.json | 9 | Group test scenario. |
+| scenarios/players/player1/curved.json | 8 | Group test scenario. |
+| scenarios/players/player1/easy_rectangle_generous.json | 4 | Group test scenario. |
+| scenarios/players/player1/gate_bonus.json | 8 | Group test scenario. |
+| scenarios/players/player1/hallway.json | 6 | Group test scenario. |
+| scenarios/players/player1/hallways.json | 9 | Group test scenario. |
+| scenarios/players/player1/hard.json | 2 | Group test scenario. |
+| scenarios/players/player1/horseshoe_room.json | 7 | Group test scenario. |
+| scenarios/players/player1/house.json | 3 | Group test scenario. |
+| scenarios/players/player1/i_room.json | 10 | Group test scenario. |
+| scenarios/players/player1/irregular_blob.json | 8 | Group test scenario. |
+| scenarios/players/player1/irregular_room_second_gate.json | 4 | Group test scenario. |
+| scenarios/players/player1/l_shaped_room.json | 5 | Group test scenario. |
+| scenarios/players/player1/l_shaped_room_scarce.json | 4 | Group test scenario. |
+| scenarios/players/player1/lollipop_trap.json | 9 | Group test scenario. |
+| scenarios/players/player1/n_shaped_room.json | 6 | Group test scenario. |
+| scenarios/players/player1/narrow.json | 6 | Group test scenario. |
+| scenarios/players/player1/octagon_shape.json | 8 | Group test scenario. |
+| scenarios/players/player1/rectangle_room.json | 5 | Group test scenario. |
+| scenarios/players/player1/simple_room.json | 2 | Group test scenario. |
+| scenarios/players/player1/spiral.json | 6 | Group test scenario. |
+| scenarios/players/player1/spiral_room.json | 7 | Group test scenario. |
+| scenarios/players/player1/square_room_w_cutouts.json | 7 | Group test scenario. |
+| scenarios/players/player1/star.json | 1 | Group test scenario. |
+| scenarios/players/player1/thirty_unit_face_straight_trap.json | 4 | Group test scenario. |
+| scenarios/players/player1/trapezoid.json | 3 | Group test scenario. |
+| scenarios/players/player1/triangle.json | 3 | Group test scenario. |
+| scenarios/players/player1/triangle_room.json | 10 | Group test scenario. |
+| scenarios/players/player1/twin_octagons.json | 10 | Group test scenario. |
+| scenarios/players/player1/two_gates.json | 2 | Group test scenario. |
+| scenarios/players/player1/u_corridor.json | 1 | Group test scenario. |
+| scenarios/players/player1/zig_room.json | 10 | Group test scenario. |
 
 ## `scripts/`
 
@@ -126,6 +194,16 @@ stand-ins, so a broken group player can't turn the simulator's tests red.
 | `.github/workflows/ci.yml` | CI. Job 1 formats, lints and tests the simulator. Job 2 runs the submission check on a pull request (skipped if it has the `maintainer` label). |
 | `.github/pull_request_template.md` | The description every pull request starts with, with a checklist. |
 | `.github/CODEOWNERS` | A template (all comments for now) for who is asked to review each group's folder. Fill it in. |
+
+## `.idea/`: tracked IDE settings
+
+| File | What it is |
+| :-- | :-- |
+| `.idea/.gitignore` | Excludes local IDE state. |
+| `.idea/inspectionProfiles/profiles_settings.xml` | Inspection profile settings. |
+| `.idea/modules.xml` | Project module registration. |
+| `.idea/playpen.iml` | IDE module configuration. |
+| `.idea/vcs.xml` | Version control mappings. |
 
 ## Generated, not tracked by git
 
