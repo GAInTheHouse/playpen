@@ -1,0 +1,16 @@
+{
+  "_description": "Twin octagons. Two identical eight-sided chambers, about 36 by 27, joined by a slanted corridor 6 units wide. Each chamber is shaped to hold one particular enclosure: an L-shape 30 wide and 20 tall with a 10x5 notch (sides 30, 15, 10, 5, 20, 20), turned 22.5 degrees, with 0.3 units to spare. Every wall of a chamber runs at 0, 45, 90 or 135 degrees, so that L lines up with none of the walls around it, and its outline rectangle (30x20) does not fit at any angle because the chamber cuts off the corner where the notch is. The only walls at 22.5 degrees are the two sides of the corridor: the hint for the angle is in a different part of the room from the answer. The room's centroid is in the corridor, so trying tilted shapes around the room's centre finds nothing. The best answer is therefore a non-rectangular shape, tilted off every nearby wall, and placed away from the centre, all at once. Only 2 diagonal connectors, so an octagonal enclosure is not an option.",
+  "room": [
+    [33.114, 22.879], [47.97, 29.033], [47.97, 38.772], [55.799, 46.601],
+    [77.232, 46.601], [83.94, 39.893], [83.94, 31.526], [72.284, 19.87],
+    [55.799, 19.87], [51.619, 24.05], [35.97, 17.568], [35.97, 11.656],
+    [24.314, 0.0], [7.829, 0.0], [0.0, 7.829], [0.0, 18.902],
+    [7.829, 26.731], [29.262, 26.731]
+  ],
+  "inventory": {
+    "walls": {"5": 6, "10": 8, "15": 4},
+    "gates": {"10": 2},
+    "connectors": {"straight": 12, "right": 8, "diagonal": 2}
+  },
+  "weights": {"A": 3.0, "C": -2.0, "G": 80.0}
+}
