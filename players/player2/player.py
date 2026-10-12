@@ -1,4 +1,7 @@
+"""Integer-face polygon template search for the Playpen simulator."""
+
 import math
+import signal
 import time
 from functools import lru_cache
 from itertools import product
@@ -16,11 +19,31 @@ class Player2(Player):
 
     # Leave ample headroom under the simulator's default 300 CPU seconds.
     # Lower this when testing with a smaller --cpu-limit.
-    SEARCH_CPU_SECONDS = 60.0
-    ALLOCATION_NODE_LIMIT = 20000
+    SEARCH_CPU_SECONDS = 15.0
+    ALLOCATION_NODE_LIMIT = 2000
+    ALLOCATION_CPU_SECONDS = 0.04
+    PLACEMENT_CPU_SECONDS = 0.08
+    MAX_CANDIDATES_PER_FAMILY = 500
 
     def build_enclosure(self) -> Construction | None:
-        deadline = time.process_time() + self.SEARCH_CPU_SECONDS
+        started = time.process_time()
+        budget = self.SEARCH_CPU_SECONDS
+        # The submission checker defaults to 60s, including initialization.
+        # On Unix, respect an already-running simulator timer with headroom.
+        if hasattr(signal, "getitimer") and hasattr(signal, "ITIMER_PROF"):
+            remaining, _ = signal.getitimer(signal.ITIMER_PROF)
+            if remaining > 0:
+                budget = min(budget, remaining * 0.7)
+        deadline = started + budget
+        wall_deadline = time.monotonic() + budget * 1.5
+
+        def expired():
+            return time.process_time() >= deadline or time.monotonic() >= wall_deadline
+
+        print(
+            f"Playpen: searching integer-sided templates ({budget:.1f}s CPU budget)",
+            flush=True,
+        )
         best = None
         best_score = 0.0  # Returning None is preferable to a negative score.
         straight = self.inventory.connectors.get(ConnectorType.STRAIGHT, 0)
@@ -43,15 +66,16 @@ class Player2(Player):
         # pieces; preserve different resource allocations for the same length.
         faces = {}
         counts = [0] * len(types)
+        face_deadline = time.process_time() + min(0.4, budget * 0.08)
 
         def enumerate_faces(first, length, number, has_gate):
-            if time.process_time() >= deadline:
+            if expired() or time.process_time() >= face_deadline:
                 return
-            if number:
+            if number == face_piece_limit:
                 faces.setdefault(length, []).append(
                     (tuple(counts), number - 1, has_gate)
                 )
-            if number >= min(6, straight + 1):
+            if number >= face_piece_limit:
                 return
             for i in range(first, len(types)):
                 new_length = length + types[i].length
@@ -61,13 +85,19 @@ class Player2(Player):
                 enumerate_faces(i, new_length, number + 1, has_gate or types[i].is_gate)
                 counts[i] -= 1
 
-        enumerate_faces(0, 0, 0, False)
+        for face_piece_limit in range(1, min(6, straight + 1) + 1):
+            enumerate_faces(0, 0, 0, False)
+            if expired() or time.process_time() >= face_deadline:
+                break
         for options in faces.values():
             options.sort(key=lambda option: (option[1], not option[2]))
 
         def allocate(lengths, required_gate_faces):
             """Bounded backtracking with shared inventory and connector counts."""
             nodes = 0
+            allocation_deadline = min(
+                deadline, time.process_time() + self.ALLOCATION_CPU_SECONDS
+            )
 
             @lru_cache(maxsize=20000)
             def search(side, remaining, available_straight, gate_faces):
@@ -75,7 +105,8 @@ class Player2(Player):
                 nodes += 1
                 if (
                     nodes > self.ALLOCATION_NODE_LIMIT
-                    or time.process_time() >= deadline
+                    or expired()
+                    or time.process_time() >= allocation_deadline
                 ):
                     return None
                 if side == len(lengths):
@@ -83,6 +114,8 @@ class Player2(Player):
                 if gate_faces + len(lengths) - side < required_gate_faces:
                     return None
                 for usage, joins, has_gate in faces[lengths[side]]:
+                    if expired() or time.process_time() >= allocation_deadline:
+                        return None
                     if joins > available_straight:
                         continue
                     if any(used > left for used, left in zip(usage, remaining)):
@@ -118,6 +151,9 @@ class Player2(Player):
                 )
 
         def placement(vertices):
+            placement_deadline = min(
+                deadline, time.process_time() + self.PLACEMENT_CPU_SECONDS
+            )
             local = Polygon(vertices)
             center = local.centroid
             # Non-symmetric templates need the full circle. Include alignment
@@ -127,7 +163,7 @@ class Player2(Player):
                 for offset in range(0, 360, 45):
                     angles.add(round((heading + offset) % 360, 9))
             for heading in sorted(angles):
-                if time.process_time() >= deadline:
+                if expired() or time.process_time() >= placement_deadline:
                     return None
                 theta = math.radians(heading)
                 co, si = math.cos(theta), math.sin(theta)
@@ -139,7 +175,7 @@ class Player2(Player):
                 ]
                 starts.extend((x - cx, y - cy) for x, y in centers)
                 for x, y in starts:
-                    if time.process_time() >= deadline:
+                    if expired() or time.process_time() >= placement_deadline:
                         return None
                     polygon = Polygon([(x + dx, y + dy) for dx, dy in offsets])
                     if buffered_room.contains(polygon):
@@ -155,7 +191,7 @@ class Player2(Player):
         room_diagonal = math.hypot(maxx - minx, maxy - miny)
         candidates = []
         generation_deadline = time.process_time() + max(
-            0.01, (deadline - time.process_time()) * 0.2
+            0.01, min(0.6, (deadline - time.process_time()) * 0.12)
         )
 
         def templates():
@@ -219,12 +255,39 @@ class Player2(Player):
             base = BASELINE_SCORE + self.weights.A * area + self.weights.C * sum(sides)
             if base + self.weights.G > 0:
                 candidates.append((base + self.weights.G, base, family, sides))
-        candidates.sort(reverse=True)
+        # Retain both high-scoring candidates and small fallback candidates.
+        # This avoids spending the whole budget on large shapes that do not fit.
+        grouped = {}
+        for candidate in candidates:
+            grouped.setdefault(candidate[2], []).append(candidate)
+        fallback, narrow, improving = [], [], []
+        for family, group in grouped.items():
+            small = sorted(group, key=lambda candidate: sum(candidate[3]))[:12]
+            fallback.extend(small)
+            if family == "rectangle":
+                # Narrow corridors can accommodate a long rectangle even
+                # when all large-area, balanced shapes fail containment.
+                narrow.extend(
+                    candidate for candidate in group if min(candidate[3]) <= 7
+                )
+            improving.extend(
+                sorted(group, reverse=True)[: self.MAX_CANDIDATES_PER_FAMILY]
+            )
+        candidates = sorted(fallback, key=lambda candidate: sum(candidate[3]))[:4]
+        candidates.extend(
+            sorted(narrow, key=lambda candidate: (min(candidate[3]), -candidate[0]))
+        )
+        candidates.extend(sorted(fallback, key=lambda candidate: sum(candidate[3])))
+        candidates.extend(sorted(improving, reverse=True))
+        seen = set()
 
         best_family = ""
         for upper_score, base, family, sides in candidates:
-            if time.process_time() >= deadline or upper_score <= best_score:
+            if expired():
                 break
+            if upper_score <= best_score or (family, sides) in seen:
+                continue
+            seen.add((family, sides))
             turns = self._template_turns(family)
             vertices = self._integer_vertices(sides, turns)
             if vertices is None:
@@ -281,10 +344,14 @@ class Player2(Player):
                 if score > best_score:
                     best, best_score = construction, score
                     best_family = family
+                    print(f"Playpen: valid {family}, score {score:.2f}", flush=True)
         self.note = (
             f"Composite {best_family}; score {best_score:.2f}."
             if best
             else "No positive-score template found within search budget."
+        )
+        print(
+            f"Playpen: {self.note} CPU {time.process_time() - started:.2f}s", flush=True
         )
         return best
 
