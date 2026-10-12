@@ -1,0 +1,56 @@
+{
+  "_description": "Bigger is worse: a T-shaped room rewards compact enclosures rather than tracing every boundary. With A=1, C=-3.5 and G=0, a central 10x15 rectangle scores 975, the full T scores 935, the 30x5 lower wing scores 905, and a 5x5 square scores 955. Inventory supports all four examples. Only right and straight connectors are available; there is one gate, so no second-gate bonus. These are validated candidate scores, not a claim of a proven global optimum.",
+  "room": [
+    [
+      0,
+      0
+    ],
+    [
+      30,
+      0
+    ],
+    [
+      30,
+      5
+    ],
+    [
+      20,
+      5
+    ],
+    [
+      20,
+      15
+    ],
+    [
+      10,
+      15
+    ],
+    [
+      10,
+      5
+    ],
+    [
+      0,
+      5
+    ]
+  ],
+  "inventory": {
+    "walls": {
+      "5": 3,
+      "10": 7
+    },
+    "gates": {
+      "5": 1
+    },
+    "connectors": {
+      "straight": 5,
+      "right": 8,
+      "diagonal": 0
+    }
+  },
+  "weights": {
+    "A": 1.0,
+    "C": -3.5,
+    "G": 0.0
+  }
+}
