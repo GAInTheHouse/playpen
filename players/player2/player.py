@@ -222,9 +222,11 @@ class Player2(Player):
         candidates.sort(reverse=True)
 
         best_family = ""
+        tried = 0
         for upper_score, base, family, sides in candidates:
             if time.process_time() >= deadline or upper_score <= best_score:
                 break
+            tried += 1
             turns = self._template_turns(family)
             vertices = self._integer_vertices(sides, turns)
             if vertices is None:
@@ -281,11 +283,20 @@ class Player2(Player):
                 if score > best_score:
                     best, best_score = construction, score
                     best_family = family
-        self.note = (
-            f"Composite {best_family}; score {best_score:.2f}."
-            if best
-            else "No positive-score template found within search budget."
-        )
+        timed_out = time.process_time() >= deadline
+        progress = f"tried {tried} of {len(candidates)} candidates"
+        if best:
+            self.note = f"Composite {best_family}; score {best_score:.2f} ({progress})."
+        elif not candidates:
+            self.note = "No candidate shape: connectors/pieces can't form any template."
+        elif timed_out:
+            self.note = (
+                f"Timed out after {self.SEARCH_CPU_SECONDS:.0f}s: {progress}, none fit."
+            )
+        else:
+            self.note = (
+                f"Searched everything: {progress}; none could be built and placed."
+            )
         return best
 
     @staticmethod
