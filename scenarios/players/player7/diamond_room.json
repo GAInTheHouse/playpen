@@ -1,0 +1,37 @@
+{
+  "_description": "Diamond room: a 40x40 square rotated 45 degrees (boundary |x-20|+|y-20| <= 20, area 800). The trap is orientation. For a diamond, the largest AXIS-ALIGNED rectangle an enclosure can inscribe has area ~R^2 (here a 20x20 square, area 400), but a square whose sides run PARALLEL TO THE DIAMOND'S EDGES (i.e. the whole enclosure rotated 45 degrees) reaches ~2*R^2 (a ~28x28 tilted square, area ~784) -- roughly double. Tilting costs nothing: a 45-degree square uses the same four right-angle connectors as an axis-aligned one; only the start_heading changes. The diamond's edge length (~28.3) is deliberately kept under the 30-unit face cap so the tilted square is actually buildable and the cap does not erase the advantage. A player hardwired to axis-aligned rectangles (e.g. one that only builds walls parallel to the x/y axes) scores far below one that rotates its candidate to match the room. Two gate lengths are supplied so a second-gate bonus is available to both strategies, keeping area the deciding term.",
+  "room": [
+    [20, 0],
+    [40, 20],
+    [20, 40],
+    [0, 20]
+  ],
+  "inventory": {
+    "walls": {
+      "8": 4,
+      "12": 4,
+      "16": 4,
+      "20": 4,
+      "24": 4,
+      "28": 4
+    },
+    "gates": {
+      "8": 2,
+      "12": 2,
+      "16": 2,
+      "20": 2,
+      "24": 2,
+      "28": 2
+    },
+    "connectors": {
+      "straight": 6,
+      "right": 16,
+      "diagonal": 6
+    }
+  },
+  "weights": {
+    "A": 2.0,
+    "C": -3.0,
+    "G": 100.0
+  }
+}
