@@ -17,7 +17,7 @@ from src.pieces import Connector, ConnectorType, Piece, PieceType
 class Player3(Player):
     """Start at roomy corners, follow the boundary, and backtrack to close."""
 
-    SEARCH_SECONDS = 60.0
+    SEARCH_SECONDS = 55.0  # Leave headroom below the submission checker's 60s limit.
     MAX_NODES = 60000
     NODES_PER_START = 3000
 
@@ -116,7 +116,7 @@ class Player3(Player):
         max_depth = min(stock.count_pieces(), stock.count_connectors(), 40)
         deadline = time.process_time() + self.SEARCH_SECONDS
         nodes = 0
-        best, best_score = None, -math.inf
+        best, best_score = None, 0.0
 
         starts = self._starts()
         # Try long boundary-following chains first; short loops are a fallback.
@@ -348,6 +348,6 @@ class Player3(Player):
         self.note = (
             f"Boundary-following backtracking: closed {len(best.pieces)} pieces"
             if best
-            else "No valid loop found within the backtracking budget"
+            else "No positive-scoring loop found within the backtracking budget"
         )
         return best
