@@ -1,4 +1,4 @@
-"""The ways the inventory can build one linear face: one or more pieces joined
+"""The ways the inventory can build one linear face: on or more pieces joined
 by STRAIGHT connectors, at most MAX_FACE_LENGTH units long."""
 
 from collections import Counter
