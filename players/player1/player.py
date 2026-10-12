@@ -33,9 +33,11 @@ from src.room import Room
 # the only setting: search time, most of the simulator's CPU limit (set
 # PLAYER1_CPU_SECONDS=20 in the environment for quick development runs)
 CPU_SECONDS = float(
-    os.environ.get("PLAYER1_CPU_SECONDS", 0.8 * c.CPU_TIME_LIMIT_SECONDS)
+    os.environ.get("PLAYER1_CPU_SECONDS", 0.01 * c.CPU_TIME_LIMIT_SECONDS)
 )
 NEARBY_RADIUS = c.MAX_FACE_LENGTH / 2  # what counts as "around" an initial solution
+CONVERGENCE_STEP_NUM = 50  # stop after this many steps without a gain above MIN_GAIN
+MIN_GAIN = 1.0  # score improvement that counts as progress
 
 CONNECTOR_FOR_TURN = {  # turn in degrees -> connector
     90: Connector(ConnectorType.RIGHT),
@@ -419,6 +421,7 @@ class Player1(Player):
         Returns the best loop seen and its score."""
         started = time.process_time()
         current, score = best, best_score = start, self.evaluate(start)
+        steps_without_gain = 0
         while (elapsed := time.process_time() - started) < cpu_seconds:
             scored = [
                 (loop, loop_score)
@@ -434,8 +437,13 @@ class Player1(Player):
             best_gain = max(gains)
             weights = [math.exp((g - best_gain) / (temperature + 1e-9)) for g in gains]
             current, score = random_state.choices(scored, weights)[0]
+            steps_without_gain += 1
             if score > best_score:
+                if score - best_score > MIN_GAIN:
+                    steps_without_gain = 0
                 best, best_score = current, score
+            if steps_without_gain >= CONVERGENCE_STEP_NUM:
+                break  # converged: early stop
         return best, best_score
 
     def build_enclosure(self) -> Construction | None:
@@ -451,10 +459,12 @@ class Player1(Player):
         # For each rectangle at different places, increase its size by as much as possible and run local search from there, returning the best result
         starts = list(dict.fromkeys(map(self.grow_to_largest, placements)))
         random_state = random.Random(0)
-        results = [
-            self.local_search(start, CPU_SECONDS / len(starts), random_state)
-            for start in starts
-        ]
+        deadline = time.process_time() + CPU_SECONDS
+        results = []
+        for i, start in enumerate(starts):
+            # an equal share of the time left, so an early stop benefits the rest
+            share = (deadline - time.process_time()) / (len(starts) - i)
+            results.append(self.local_search(start, share, random_state))
         best, score = max(results, key=lambda result: result[1])
         self.note = f"{len(starts)} initial solutions; best {score:.0f} ({len(best.faces)} faces)"
         return to_construction(best)
