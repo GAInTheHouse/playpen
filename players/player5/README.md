@@ -13,8 +13,8 @@ Run an existing Player 5 scenario:
 uv run main.py --player 5 --scenario scenarios/players/player5/rectangle_room.json --seed 1
 ```
 
-Searches that exhaust their tree return early. Scenario replacements are
-separate from this implementation; this branch keeps the upstream scenarios.
+Searches that exhaust their tree return early. The upstream Player 5 scenarios are retained alongside the additional
+T-shaped scenario described below.
 
 Each worker explores a disjoint subset of the first connector/wall choices
 for each gate length. Normal DFS continues below those branches. Workers do
@@ -100,6 +100,22 @@ model, not over continuous placements or constructions with extra gates.
 Runtime grows exponentially; recursive traversal is intended for small
 inventories. More workers do not necessarily mean more useful search on a
 fixed machine, because of startup, scheduling, and static partition imbalance.
+
+The additional scenario `scenarios/players/player5/bigger_is_worse.json` is a
+T-shaped room with a 30-by-5 lower wing and a 10-by-10 central upper chamber.
+Its perimeter penalty rewards compact enclosures; inventory supports every
+candidate below, including the reflex turns around the full T.
+
+| Candidate | Area | Perimeter | Score |
+| :-- | --: | --: | --: |
+| Full T | 250 | 90 | 935 |
+| Lower 30-by-5 wing | 150 | 70 | 905 |
+| Central 10-by-15 rectangle | 150 | 50 | 975 |
+| Small 5-by-5 square | 25 | 20 | 955 |
+
+These are candidate comparisons, not a proven global optimum. The centered
+gate and fixed heading used by this player further restrict which candidates
+it can reach.
 
 Run tests and benchmark all player scenarios:
 

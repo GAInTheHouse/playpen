@@ -126,6 +126,7 @@ Canonical paths and group numbers follow the convention above.
 | scenarios/players/player1/32_edge_concave_room.json | 9 | Group test scenario. |
 | scenarios/players/player1/B.json | 1 | Group test scenario. |
 | scenarios/players/player1/angled_room.json | 5 | Group test scenario. |
+| scenarios/players/player1/bigger_is_worse.json | 5 | T-shaped room where compact enclosures beat the full room despite enclosing less area. |
 | scenarios/players/player1/coms4444.json | 1 | Group test scenario. |
 | scenarios/players/player1/cool.json | 2 | Group test scenario. |
 | scenarios/players/player1/cross_gate_bonus.json | 6 | Group test scenario. |
