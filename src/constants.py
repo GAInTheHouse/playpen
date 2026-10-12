@@ -8,7 +8,7 @@ INFO_PORTION = 1 - ROOM_PORTION
 SCREEN_PADDING_X = 40
 SCREEN_PADDING_Y = 140
 MIN_WINDOW_WIDTH = 900
-MIN_WINDOW_HEIGHT = 640
+MIN_WINDOW_HEIGHT = 750  # the tallest result panel fits at this height
 FONT_SIZE = 16
 TITLE_FONT_SIZE = 20
 SMALL_FONT_SIZE = 11
@@ -40,6 +40,9 @@ DIVIDER_COLOR = "#E0E6ED"
 SECTION_HEADER_COLOR = "#2B4C6F"
 STAT_VALUE_COLOR = "#14324D"
 TOOLTIP_BG = "#FFFDE7"
+INVENTORY_BOX_HEIGHT = 96  # pixels: small on purpose, it scrolls
+INVENTORY_CHOSEN_BG = "#FFF1B8"  # an inventory row the enclosure uses
+NEGATIVE_BG = "#FADBD8"  # behind a negative score, and a row the inventory is short of
 HOVER_RADIUS = 12  # pixels: how close the mouse must be to a joint to pick it
 
 # LOGIC / RULES (see Project 2: Playpen spec)

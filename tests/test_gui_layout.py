@@ -99,7 +99,23 @@ def _check(game: Game, label: str) -> None:
             f"{label}: {text[:30]!r} runs off the bottom ({y1}>{panel_h})"
         )
 
-    # 3. the room view: everything drawn (room and enclosure) is inside it
+    # 3. embedded widgets (the inventory box, the button) stay inside the panel
+    #    and clear of the text
+    for item in game.info.find_all():
+        if game.info.type(item) != "window":
+            continue
+        wx0, wy0, wx1, wy1 = game.info.bbox(item)
+        assert wx1 <= panel_w and wy1 <= panel_h, (
+            f"{label}: a widget runs off the panel: {(wx0, wy0, wx1, wy1)} in {panel_w}x{panel_h}"
+        )
+        for text, (tx0, ty0, tx1, ty1) in texts:
+            overlap_x = min(wx1, tx1) - max(wx0, tx0)
+            overlap_y = min(wy1, ty1) - max(wy0, ty0)
+            assert not (overlap_x > 1 and overlap_y > 1), (
+                f"{label}: a widget overlaps {text[:30]!r}"
+            )
+
+    # 4. the room view: everything drawn (room and enclosure) is inside it
     view_w, view_h = game.canvas.winfo_width(), game.canvas.winfo_height()
     for item in game.canvas.find_all():
         x0, y0, x1, y1 = game.canvas.bbox(item)
@@ -133,7 +149,7 @@ def test_every_invalid_example_lays_out_cleanly():
 
 def test_layout_holds_at_several_window_sizes():
     def body(game):
-        for width, height in [(900, 640), (1100, 700), (1300, 760)]:
+        for width, height in [(900, 750), (1100, 790), (1300, 760)]:
             _resize(game, width, height)
             for n in range(len(EXAMPLES)):
                 _click(game)
@@ -262,7 +278,7 @@ def test_tooltip_appears_only_near_a_joint_and_goes_away():
 
 def test_tooltip_always_stays_inside_the_room_view():
     def body(game):
-        for width, height in [(900, 660), (1300, 760)]:
+        for width, height in [(900, 750), (1300, 760)]:
             _resize(game, width, height)
             for n in range(len(EXAMPLES)):
                 _click(game)

@@ -93,6 +93,9 @@ A scenario is a JSON file: `room` (polygon corners), `inventory`, `weights`.
 | `scenarios/l_shaped_room.json` | A non-convex L-shaped room with a scarcer inventory. |
 | `scenarios/limits_tight_room_favors_small_shape.json` | A tight room where only the smallest of many possible rectangles fits; it caught a real bug in the example player's shape ranking. |
 | `scenarios/invalid_examples.json` | The room and inventory the invalid-enclosure demo is built around (an L-shaped room, plus the odd pieces its examples need). |
+| `scenarios/B.json` | A 29-corner non-convex room (26 x 32) with 1000 of every wall length, one gate, and weights that reward area only. A stress test for placement. |
+| `scenarios/coms4444.json` | A very large non-convex room (176 corners, 236 x 41) with 1000 of every wall length. A stress test for speed. |
+| `scenarios/star.json` | A five-pointed-star room (10 corners) with 1000 of every wall length and no diagonal connectors. |
 | `scenarios/players/player1/` ... `player10/` | One folder per group for its own test scenarios. Each holds a `.gitkeep` so git keeps the empty folder. |
 
 ## `scripts/`
@@ -116,6 +119,7 @@ stand-ins, so a broken group player can't turn the simulator's tests red.
 | `tests/test_runlog.py` | Log files: mirrors stdout/stderr, header and footer, crashes, unique names, and `main.py` end to end. |
 | `tests/test_submissions.py` | Finding group players, the ownership rules, the submission checker. |
 | `tests/test_gui_layout.py` | The GUI: no overlapping text, nothing clipped at several window sizes, hover tooltips, the score panel. Needs a display. |
+| `tests/test_gui_inventory.py` | The GUI's inventory box (every item listed, used ones highlighted, scrolling), the red negative score, and the panel scrolling on a short screen. Needs a display. |
 | `tests/test_placement_guide.py` | Runs every code block in `PLACEMENT_GUIDE.md` and checks the numbers it claims; checks the docs only name files that exist, and that this file lists every file. |
 | `tests/__init__.py` | Empty; makes `tests` a package. |
 
@@ -133,4 +137,5 @@ stand-ins, so a broken group player can't turn the simulator's tests red.
 | :-- | :-- |
 | `logs/` | One log file per run: the command, the output, how it ended. |
 | `.venv/` | The Python environment `uv sync` creates. |
+| `.idea/` | PyCharm's project settings (kept out of git). |
 | `__pycache__/`, `.ruff_cache/` | Python and `ruff` caches. |
