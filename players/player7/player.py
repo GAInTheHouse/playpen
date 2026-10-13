@@ -3,6 +3,7 @@ import time
 from collections import Counter
 
 from shapely.geometry import Point, Polygon, box
+from shapely.ops import polylabel
 from shapely.prepared import prep
 
 import src.constants as c
@@ -20,8 +21,12 @@ MAX_SHAPES = 500
 RIGHT = [Connector(ConnectorType.RIGHT)] * 4
 DIAGONAL = [Connector(ConnectorType.DIAGONAL)] * 8
 
-# orthogonal (edge-list) search tuning
-ORTHO_CPU_BUDGET = 45.0  # seconds of CPU the orthogonal search may spend
+# shape search (edge-list beam search) tuning
+SEARCH_CPU_BUDGET = 45.0  # seconds of CPU the shape search may spend
+OCT_PLACEMENTS = 1500  # octagon candidates tried for placement before giving up
+OCT_HEADINGS = [i * 7.5 for i in range(6)]  # rotations in [0, 45) when placing
+OCT_GRID = 12  # grid of candidate centers (per axis) for placing octagons
+OCT_ANCHORS = 12  # deepest centers tried per octagon
 POS_STEP = 1.0  # smallest grid step (units) when scanning rectangle positions
 POS_MAX_STEPS = 32  # cap positions per axis so big rooms stay fast
 MAX_ARMS = 8  # beam levels: each level adds one tab (one concave corner)
@@ -99,6 +104,39 @@ def _clean(verts):
     return out
 
 
+def _octagon_faces(a, b, cc, d):
+    """The non-empty faces of the octagon E=a, NE=cc, N=b, NW=d, W=a, SW=cc,
+    S=b, SE=d, as (direction index 0..7, length), counter-clockwise."""
+    return [(k, f) for k, f in enumerate((a, cc, b, d, a, cc, b, d)) if f > 0]
+
+
+def _octagon_turns(a, b, cc, d):
+    """(45-degree corners, 90-degree corners) of that octagon, or None if some
+    corner would need a 135-degree turn, which no connector makes."""
+    faces = _octagon_faces(a, b, cc, d)
+    n45 = n90 = 0
+    for i in range(len(faces)):
+        step = (faces[i][0] - faces[i - 1][0]) % 8
+        if step == 1:
+            n45 += 1
+        elif step == 2:
+            n90 += 1
+        else:
+            return None
+    return n45, n90
+
+
+def _octagon_verts(a, b, cc, d):
+    """That octagon's corners, centered on its centroid."""
+    pts, x, y = [], 0.0, 0.0
+    for k, f in _octagon_faces(a, b, cc, d):
+        pts.append((x, y))
+        t = math.radians(45 * k)
+        x, y = x + f * math.cos(t), y + f * math.sin(t)
+    cx, cy = _centroid(pts)
+    return [(px - cx, py - cy) for px, py in pts]
+
+
 def _canon(verts):
     """A rotation-independent key for an outline, to spot duplicate shapes."""
     pts = [(round(x, 6), round(y, 6)) for x, y in verts]
@@ -128,10 +166,11 @@ class Player7(Player):
     the higher-scoring valid one wins:
 
     - "classic": the largest valid rectangle and octagon (good on convex rooms).
-    - "orthogonal": an edge-list beam search -- start from the best buildable
-      rectangles, add one rectangular tab (one concave corner) per level, keep
-      the best few shapes per level, return the best seen (good on stars,
-      L-shapes, crosses...).
+    - "search": an edge-list beam search -- start from the best buildable
+      rectangles and octilinear octagons (several rotations), add one
+      rectangular tab (one concave corner) per level, keep the best few shapes
+      per level, return the best seen (good on stars, L-shapes, crosses,
+      slanted rooms...).
     """
 
     def build_enclosure(self) -> Construction | None:
@@ -140,11 +179,11 @@ class Player7(Player):
         if classic is not None:
             candidates.append(("classic", classic))
         try:
-            ortho = self._orthogonal()
+            found = self._search()
         except Exception:  # noqa: BLE001 -- a search bug must never beat the valid fallback
-            ortho = None
-        if ortho is not None:
-            candidates.append(("orthogonal", ortho))
+            found = None
+        if found is not None:
+            candidates.append(("search", found))
 
         best, best_score, best_name = None, None, None
         for name, construction in candidates:
@@ -301,17 +340,17 @@ class Player7(Player):
                 if polygon.contains(Point(x, y)):
                     yield (x, y)
 
-    # ---- orthogonal strategy (edge-list rectilinear search) -----------------
+    # ---- shape search (edge-list beam search, right and 45-degree faces) ----
 
-    def _orthogonal(self):
-        """Beam search over rectilinear shapes. Level 0 is the best few buildable
-        rectangles; each level adds one tab (one more concave corner) to every
-        shape in the beam and keeps the best BEAM_WIDTH results, even when they
-        score below their parent, so the search can pass through a worse
+    def _search(self):
+        """Beam search over buildable shapes. Level 0 is the best few starting
+        shapes: axis-aligned rectangles plus octilinear octagons (any face may be
+        missing, so hexagons, parallelograms and rotated rectangles too) at
+        several rotations. Each level adds one tab (one more concave corner) to
+        every shape in the beam and keeps the best BEAM_WIDTH results, even when
+        they score below their parent, so the search can pass through a worse
         intermediate shape. The best shape seen at any level wins."""
         if not self.inventory.has_gate():
-            return None
-        if self.inventory.connectors.get(ConnectorType.RIGHT, 0) < 4:
             return None
         coins = [
             length
@@ -329,21 +368,19 @@ class Player7(Player):
         self._gate_lengths = sorted(g for g, n in self.inventory.gates.items() if n > 0)
         self._hostable = {
             L
-            for L in self._buildables
+            for L in set(self._buildables) | set(self._gate_lengths)
             if any(L == g or (L - g) in self._table for g in self._gate_lengths)
         }
-        if not self._hostable:  # no face length can carry the one required gate
-            return None
+        self._faceable = set(self._buildables) | set(self._gate_lengths)
         self._room_prep = prep(self.room.polygon)
         self._decomp_cache = {}
 
-        deadline = time.process_time() + ORTHO_CPU_BUDGET
-        beam = [
-            (score, _clean(verts), construction)
-            for verts, construction, score in self._best_rectangles(
-                deadline, BEAM_WIDTH
-            )
-        ]
+        deadline = time.process_time() + SEARCH_CPU_BUDGET
+        starts = []
+        if self.inventory.connectors.get(ConnectorType.RIGHT, 0) >= 4:
+            starts += self._best_rectangles(deadline, BEAM_WIDTH)
+        starts += self._octilinear_bases(deadline, BEAM_WIDTH)
+        beam = [(score, _clean(verts), cons) for verts, cons, score in starts]
         best = max(beam, key=lambda s: s[0], default=None)
         for _level in range(MAX_ARMS):
             if not beam or time.process_time() > deadline:
@@ -378,8 +415,8 @@ class Player7(Player):
         return best[2] if best else None
 
     def _best_rectangles(self, deadline, k):
-        """Up to k highest-scoring buildable rectangles that fit, each placed most
-        centrally. Returns [(vertices, construction, score)]."""
+        """Up to k highest-scoring buildable axis-aligned rectangles that fit,
+        each placed most centrally. Returns [(vertices, construction, score)]."""
         minx, miny, maxx, maxy = self.room.polygon.bounds
         bbx, bby = maxx - minx, maxy - miny
         A, C = self.weights.A, self.weights.C
@@ -436,11 +473,111 @@ class Player7(Player):
             x += sx
         return best
 
+    def _octilinear_bases(self, deadline, k):
+        """Up to k highest-scoring octagons with faces E=W=a, NE=SW=c, N=S=b,
+        NW=SE=d that fit somewhere in the room. With integer faces the loop only
+        closes if opposite faces have equal totals, but a face may be several
+        pieces (5+7 opposite 12), so this is far wider than matched pairs. Any
+        of a, b, c, d may be 0, which also gives hexagons, parallelograms and
+        (rotated) rectangles. Returns [(vertices, construction, score)]."""
+        room = self.room.polygon
+        pole = polylabel(room, tolerance=0.25)
+        # candidate centers, deepest first, with their distance to the walls
+        depths = sorted(
+            (
+                (room.exterior.distance(Point(x, y)), x, y)
+                for x, y in [(pole.x, pole.y), *self._grid_points(OCT_GRID)]
+            ),
+            reverse=True,
+        )
+        reach = depths[0][0] + 0.25  # polylabel is within 0.25 of the true max
+        A, C = self.weights.A, self.weights.C
+        lengths = [0] + [L for L in sorted(self._faceable) if L >= c.MIN_WALL_LENGTH]
+        r2 = math.sqrt(2)
+        have45 = self.inventory.connectors.get(ConnectorType.DIAGONAL, 0)
+        have90 = self.inventory.connectors.get(ConnectorType.RIGHT, 0)
+        candidates = []
+        for a in lengths:
+            for b in lengths:
+                for cc in lengths:
+                    for d in lengths:
+                        turns = _octagon_turns(a, b, cc, d)
+                        if turns is None or turns[0] > have45 or turns[1] > have90:
+                            continue
+                        wx = a + (cc + d) / r2
+                        hy = b + (cc + d) / r2
+                        # these octagons are centrally symmetric, so their largest
+                        # inscribed disk is centered on the centroid with radius
+                        # half their smallest width, which is one of these four
+                        inner = min(wx, hy, cc + (a + b) / r2, d + (a + b) / r2) / 2
+                        if inner > reach:
+                            continue  # no spot in the room is that deep
+                        area = wx * hy - (cc * cc + d * d) / 2
+                        if area <= 1e-9 or area > room.area:
+                            continue
+                        if not any(f in self._hostable for f in (a, b, cc, d) if f):
+                            continue
+                        perimeter = 2 * (a + b + cc + d)
+                        est = A * area + C * perimeter
+                        candidates.append((est, inner, a, b, cc, d))
+        candidates.sort(reverse=True)
+
+        out, attempts = [], 0
+        for _est, inner, a, b, cc, d in candidates:
+            if len(out) >= k or attempts >= OCT_PLACEMENTS:
+                break
+            if time.process_time() > deadline:
+                break
+            # the centroid must sit at least `inner` from every wall
+            anchors = [(x, y) for depth, x, y in depths if depth >= inner - 1e-9]
+            anchors = anchors[:OCT_ANCHORS]
+            if not anchors:
+                continue
+            attempts += 1
+            verts = self._place(_octagon_verts(a, b, cc, d), anchors)
+            if verts is None:
+                continue
+            construction = self._to_construction(verts)
+            if construction is None:
+                continue
+            result = validate_construction(construction, self.room, self.inventory)
+            if result.valid:
+                out.append(
+                    (verts, construction, score_construction(result, self.weights))
+                )
+        return out
+
+    def _grid_points(self, steps):
+        """Points of a steps x steps grid over the room's bounds that lie inside."""
+        polygon = self.room.polygon
+        minx, miny, maxx, maxy = polygon.bounds
+        for i in range(steps):
+            for j in range(steps):
+                x = minx + (maxx - minx) * (i + 0.5) / steps
+                y = miny + (maxy - miny) * (j + 0.5) / steps
+                if polygon.contains(Point(x, y)):
+                    yield (x, y)
+
+    def _place(self, local, anchors):
+        """First anchor/rotation at which this shape (centered on its centroid)
+        fits in the room, or None. Turning one of these octagons by 45 degrees
+        gives another candidate, so rotations below 45 degrees are enough."""
+        for ax, ay in anchors:
+            for heading in OCT_HEADINGS:
+                t = math.radians(heading)
+                ct, st = math.cos(t), math.sin(t)
+                pts = [(ax + x * ct - y * st, ay + x * st + y * ct) for x, y in local]
+                if self._room_prep.contains(Polygon(pts)):
+                    return pts
+        return None
+
     def _tab_moves(self, verts, deadline):
         """Every buildable tab on every edge of this (clean, CCW) outline, each at
         the deepest depth that fits. Yields (estimated pre-gate score, new
         outline). The estimate is exact for area and perimeter: a w x h tab adds
-        w*h area and 2h perimeter wherever it sits."""
+        w*h area and 2h perimeter wherever it sits. Edges may run in any of the
+        shape's eight directions; a tab's sides are perpendicular to its edge,
+        so they stay in those directions too."""
         A, C = self.weights.A, self.weights.C
         poly = Polygon(verts)
         base = A * poly.area + C * poly.length
@@ -483,18 +620,22 @@ class Player7(Player):
         ax, ay = p[0] + dx * s, p[1] + dy * s
         bx, by = p[0] + dx * (s + w), p[1] + dy * (s + w)
 
+        def rect(lo, hi):
+            return Polygon(
+                [
+                    (ax + nx * lo, ay + ny * lo),
+                    (bx + nx * lo, by + ny * lo),
+                    (bx + nx * hi, by + ny * hi),
+                    (ax + nx * hi, ay + ny * hi),
+                ]
+            )
+
         def fits(h):
-            xs = (ax, bx, ax + nx * h, bx + nx * h)
-            ys = (ay, by, ay + ny * h, by + ny * h)
-            tab = box(min(xs), min(ys), max(xs), max(ys))
-            if not self._room_prep.contains(tab):
+            if not self._room_prep.contains(rect(0, h)):
                 return False
             # the same rectangle minus a sliver at its base must not touch the
             # shape, or the tab would overlap it or pinch against another arm
-            e = 1e-6
-            xs = (ax + nx * e, bx + nx * e, ax + nx * h, bx + nx * h)
-            ys = (ay + ny * e, by + ny * e, ay + ny * h, by + ny * h)
-            return not poly_prep.intersects(box(min(xs), min(ys), max(xs), max(ys)))
+            return not poly_prep.intersects(rect(1e-6, h))
 
         asc = self._buildables
         if not fits(asc[0]):
@@ -509,29 +650,47 @@ class Player7(Player):
         return asc[best]
 
     def _to_construction(self, verts):
-        """Turn an axis-aligned rectilinear vertex loop into a Construction: each
-        edge is one face, built from pieces the inventory can actually supply
-        (see `_allocate`), joined by straight connectors within a face and right
-        connectors (reflex where the corner turns in) between faces. Returns
-        None if it can't be built."""
+        """Turn a vertex loop whose edges all run in multiples of 45 degrees from
+        the first one into a Construction: each edge is one face, built from
+        pieces the inventory can actually supply (see `_allocate`), joined by
+        straight connectors within a face; corners get right connectors (90
+        degree turns) or diagonal ones (45 degree turns), reflex where the corner
+        turns in. Returns None if it can't be built."""
         verts = _clean(verts)
         n = len(verts)
         if n < c.MIN_ENCLOSURE_PIECES:
             return None
-        if n > self.inventory.connectors.get(ConnectorType.RIGHT, 0):
-            return None
 
-        lengths, headings = [], []
+        lengths, steps = [], []
+        h0 = None
         for i in range(n):
             p, q = verts[i], verts[(i + 1) % n]
             dx, dy = q[0] - p[0], q[1] - p[1]
-            if abs(dx) > 1e-6 and abs(dy) > 1e-6:
-                return None  # not axis-aligned
-            length = round(math.hypot(dx, dy))
-            if length < c.MIN_WALL_LENGTH or length not in self._table:
+            raw = math.hypot(dx, dy)
+            length = round(raw)
+            if abs(raw - length) > 1e-6 or length not in self._faceable:
                 return None
+            angle = math.degrees(math.atan2(dy, dx))
+            if h0 is None:
+                h0 = angle
+            k = round((angle - h0) / 45)
+            if abs(angle - h0 - 45 * k) > 1e-4:
+                return None  # not one of this shape's eight directions
             lengths.append(length)
-            headings.append(round(math.degrees(math.atan2(dy, dx))) % 360)
+            steps.append(k)
+
+        corners = []
+        for i in range(n):
+            turn = ((steps[i] - steps[i - 1]) * 45 + 180) % 360 - 180
+            if abs(turn) == 90:
+                corners.append(Connector(ConnectorType.RIGHT, reflex=turn < 0))
+            elif abs(turn) == 45:
+                corners.append(Connector(ConnectorType.DIAGONAL, reflex=turn < 0))
+            else:
+                return None  # a 135-degree turn has no connector
+        need = Counter(conn.connector_type for conn in corners)
+        if any(need[t] > self.inventory.connectors.get(t, 0) for t in need):
+            return None
 
         faces = None
         if self.weights.G > 0 and sum(self.inventory.gates.values()) >= 2:
@@ -543,14 +702,12 @@ class Player7(Player):
 
         pieces, connectors = [], []
         for i in range(n):
-            turn = ((headings[i] - headings[i - 1] + 180) % 360) - 180  # +90 or -90
-            corner = Connector(ConnectorType.RIGHT, reflex=turn < 0)
             for k, piece in enumerate(faces[i]):
                 pieces.append(piece)
                 connectors.append(
-                    corner if k == 0 else Connector(ConnectorType.STRAIGHT)
+                    corners[i] if k == 0 else Connector(ConnectorType.STRAIGHT)
                 )
-        return Construction(verts[0], float(headings[0]), pieces, connectors)
+        return Construction(verts[0], h0, pieces, connectors)
 
     def _decomps(self, length):
         """All ways to write `length` as a sum of available wall lengths (as
