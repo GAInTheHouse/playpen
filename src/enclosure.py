@@ -9,13 +9,14 @@ pieces/turns must arrive back at the starting point and heading.
 """
 
 import math
+from collections import Counter
 from dataclasses import dataclass, field
 
 from shapely.geometry import Polygon
 
 import src.constants as c
 from src.inventory import Inventory
-from src.pieces import Connector, Piece
+from src.pieces import Connector, ConnectorType, Piece
 from src.room import Room
 from src.weights import Weights
 
@@ -207,6 +208,70 @@ def unavailable_items(
         if not scratch.take_connector(connector.connector_type)
     ]
     return short_pieces, short_connectors
+
+
+@dataclass(frozen=True)
+class InventoryRow:
+    """One kind of item in the inventory, and how much of it a construction uses."""
+
+    kind: str  # "wall", "gate" or "connector"
+    key: int | str  # a length in units for walls and gates, a connector type's name
+    available: int
+    used: int
+
+    @property
+    def short(self) -> int:
+        """How many more are wanted than the inventory has."""
+        return max(0, self.used - self.available)
+
+
+def inventory_usage(
+    construction: Construction | None, inventory: Inventory
+) -> list[InventoryRow]:
+    """Every kind of item in the inventory, with how many of each the
+    construction uses (none, if `construction` is None).
+
+    Rows are walls by length, then gates by length, then connectors (all three
+    types, even ones the inventory has none of -- running out is worth seeing).
+    A wall or gate length appears if the inventory has some or the construction
+    uses some; so a piece the inventory has none of at all still shows up, as
+    available 0. The caller's inventory is not changed.
+    """
+    used_pieces = Counter(
+        (piece.is_gate, piece.length)
+        for piece in (construction.pieces if construction else [])
+    )
+    used_connectors = Counter(
+        connector.connector_type
+        for connector in (construction.connectors if construction else [])
+    )
+
+    rows = []
+    for kind, stock, is_gate in (
+        ("wall", inventory.walls, False),
+        ("gate", inventory.gates, True),
+    ):
+        lengths = {length for length, n in stock.items() if n > 0}
+        lengths |= {length for (gate, length) in used_pieces if gate == is_gate}
+        for length in sorted(lengths):
+            rows.append(
+                InventoryRow(
+                    kind,
+                    length,
+                    max(stock.get(length, 0), 0),
+                    used_pieces[(is_gate, length)],
+                )
+            )
+    for connector_type in ConnectorType:
+        rows.append(
+            InventoryRow(
+                "connector",
+                connector_type.value,
+                max(inventory.connectors.get(connector_type, 0), 0),
+                used_connectors[connector_type],
+            )
+        )
+    return rows
 
 
 def validate_construction(

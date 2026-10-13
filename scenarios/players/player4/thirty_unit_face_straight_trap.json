@@ -1,0 +1,27 @@
+{
+  "_description": "Tests the 30-unit linear-face cap when a side is built from several walls joined by STRAIGHT connectors (see tests/test_enclosure.py::test_face_too_long_is_invalid). The room is a plain rectangle and every wall segment is 12 units long—no single piece can span a 30+ side. A natural greedy move is a 36×N rectangle with three 12s on each long side (two straights between them); that closes geometrically but one face is 36 units and scores -1000. A valid plan is a 24×24 box with two 12s per side and exactly one straight per side (four straights total). Unlike player8/gate_bonus (straight=0, long unit walls), player9/lollipop_trap (diagonal shortage), or limits_tight_room (tiny room / area ranking), this isolates composite-face length and straight-connector budgeting.",
+  "room": [
+    [0, 0],
+    [44, 0],
+    [44, 44],
+    [0, 44]
+  ],
+  "inventory": {
+    "walls": {
+      "12": 10
+    },
+    "gates": {
+      "12": 2
+    },
+    "connectors": {
+      "straight": 4,
+      "right": 8,
+      "diagonal": 2
+    }
+  },
+  "weights": {
+    "A": 2.0,
+    "C": -3.0,
+    "G": 100.0
+  }
+}
