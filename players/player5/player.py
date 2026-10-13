@@ -79,7 +79,9 @@ class Player5(Player):
             not math.isfinite(time_limit) or time_limit <= 0
         ):
             raise ValueError("time_limit must be finite and positive, or None")
-        self.workers = workers or 1  # Accepted for compatibility; beam search is serial.
+        self.workers = (
+            workers or 1
+        )  # Accepted for compatibility; beam search is serial.
         self.time_limit = time_limit
         self.distance_pruning = distance_pruning
         self.turn_pruning = turn_pruning
@@ -121,10 +123,16 @@ class Player5(Player):
         choices = [
             Connector(kind, reflex)
             for kind in ConnectorType
-            for reflex in ((False,) if kind == ConnectorType.STRAIGHT else (False, True))
+            for reflex in (
+                (False,) if kind == ConnectorType.STRAIGHT else (False, True)
+            )
         ]
         turns = [joint for joint in choices if not joint.is_straight()]
-        lengths = sorted(k for k, n in stock0.walls.items() if n and MIN_WALL_LENGTH <= k <= MAX_FACE_LENGTH)
+        lengths = sorted(
+            k
+            for k, n in stock0.walls.items()
+            if n and MIN_WALL_LENGTH <= k <= MAX_FACE_LENGTH
+        )
 
         def heuristic(state):
             # Estimate area if the chain closed directly to its gate start.
@@ -133,8 +141,7 @@ class Player5(Player):
             pts = state["points"]
             ring = [*pts, pts[0]]
             doubled_area = sum(
-                x * ny - nx * y
-                for (x, y), (nx, ny) in zip(ring, ring[1:])
+                x * ny - nx * y for (x, y), (nx, ny) in zip(ring, ring[1:])
             )
             estimated_area = abs(doubled_area) / 2
             distance = math.dist(pts[-1], pts[0])
@@ -170,12 +177,19 @@ class Player5(Player):
                 zero = (0,) * len(lengths)
                 dp = {(0, 0): [zero]}
                 for index, length in enumerate(lengths):
-                    updated = {key: list(allocations) for key, allocations in dp.items()}
+                    updated = {
+                        key: list(allocations) for key, allocations in dp.items()
+                    }
                     available = max(0, state["stock"].walls.get(length, 0))
                     for (piece_count, total), allocations in dp.items():
                         for quantity in range(
                             1,
-                            min(available, max_pieces - piece_count, (face_limit - total) // length) + 1,
+                            min(
+                                available,
+                                max_pieces - piece_count,
+                                (face_limit - total) // length,
+                            )
+                            + 1,
                         ):
                             key = (piece_count + quantity, total + quantity * length)
                             options = updated.setdefault(key, [])
@@ -183,7 +197,10 @@ class Player5(Player):
                                 candidate_allocation = list(allocation)
                                 candidate_allocation[index] += quantity
                                 candidate_allocation = tuple(candidate_allocation)
-                                if candidate_allocation not in options and len(options) < 2:
+                                if (
+                                    candidate_allocation not in options
+                                    and len(options) < 2
+                                ):
                                     options.append(candidate_allocation)
                     dp = updated
 
@@ -196,7 +213,9 @@ class Player5(Player):
                     end = (px + total * math.cos(rad), py + total * math.sin(rad))
                     if not room_area.covers(LineString([state["points"][-1], end])):
                         continue
-                    check_end = state["start"] if math.dist(end, state["start"]) <= TOL else end
+                    check_end = (
+                        state["start"] if math.dist(end, state["start"]) <= TOL else end
+                    )
                     if not LineString([*state["points"], check_end]).is_simple:
                         continue
                     legal_totals[(piece_count, total)] = end
@@ -215,13 +234,32 @@ class Player5(Player):
                         points = list(state["points"])
                         for length in pieces_to_add:
                             prior_x, prior_y = points[-1]
-                            points.append((prior_x + length * math.cos(rad), prior_y + length * math.sin(rad)))
+                            points.append(
+                                (
+                                    prior_x + length * math.cos(rad),
+                                    prior_y + length * math.sin(rad),
+                                )
+                            )
                         candidate = {
-                            "start": state["start"], "points": points,
+                            "start": state["start"],
+                            "points": points,
                             "heading": heading,
                             "face": initial_face + total,
-                            "pieces": [*state["pieces"], *(Piece(PieceType.WALL, length) for length in pieces_to_add)],
-                            "joints": [*state["joints"], first_joint, *(Connector(ConnectorType.STRAIGHT) for _ in range(piece_count - 1))],
+                            "pieces": [
+                                *state["pieces"],
+                                *(
+                                    Piece(PieceType.WALL, length)
+                                    for length in pieces_to_add
+                                ),
+                            ],
+                            "joints": [
+                                *state["joints"],
+                                first_joint,
+                                *(
+                                    Connector(ConnectorType.STRAIGHT)
+                                    for _ in range(piece_count - 1)
+                                ),
+                            ],
                             "stock": next_stock,
                         }
                         candidates.append((candidate, total, piece_count, allocation))
@@ -231,7 +269,10 @@ class Player5(Player):
                 def keep_best(options):
                     for option in sorted(options, key=lambda item: heuristic(item[0])):
                         signature = (option[1], option[2], option[3])
-                        if all((item[1], item[2], item[3]) != signature for item in selected):
+                        if all(
+                            (item[1], item[2], item[3]) != signature
+                            for item in selected
+                        ):
                             selected.append(option)
                             return
 
@@ -243,27 +284,46 @@ class Player5(Player):
                     target = longest * 0.7
                     closest_total = min(abs(option[1] - target) for option in shorter)
                     keep_best(
-                        [option for option in shorter if abs(option[1] - target) == closest_total]
+                        [
+                            option
+                            for option in shorter
+                            if abs(option[1] - target) == closest_total
+                        ]
                     )
                 yield from (option[0] for option in selected)
 
         frontier = []
         theta = math.radians(self.start_heading)
         for gate_length, count in sorted(stock0.gates.items()):
-            if count <= 0 or gate_length < MIN_WALL_LENGTH or gate_length > MAX_FACE_LENGTH:
+            if (
+                count <= 0
+                or gate_length < MIN_WALL_LENGTH
+                or gate_length > MAX_FACE_LENGTH
+            ):
                 continue
             if self.gate_length is not None and gate_length != self.gate_length:
                 continue
             start = self.start or self.edge_start
-            end = (start[0] + gate_length * math.cos(theta), start[1] + gate_length * math.sin(theta))
+            end = (
+                start[0] + gate_length * math.cos(theta),
+                start[1] + gate_length * math.sin(theta),
+            )
             if not room_area.covers(LineString([start, end])):
                 self.stats.boundary_prunes += 1
                 continue
             stock = stock0.copy()
             stock.gates[gate_length] -= 1
-            frontier.append({"start": start, "points": [start, end], "heading": self.start_heading,
-                "face": gate_length, "pieces": [Piece(PieceType.GATE, gate_length)],
-                "joints": [], "stock": stock})
+            frontier.append(
+                {
+                    "start": start,
+                    "points": [start, end],
+                    "heading": self.start_heading,
+                    "face": gate_length,
+                    "pieces": [Piece(PieceType.GATE, gate_length)],
+                    "joints": [],
+                    "stock": stock,
+                }
+            )
 
         while frontier:
             if deadline is not None and time.monotonic() >= deadline:
@@ -280,14 +340,22 @@ class Player5(Player):
                     for closing in choices:
                         if stock.connectors.get(closing.connector_type, 0) <= 0:
                             continue
-                        gap = (state["heading"] + closing.turn_angle() - self.start_heading) % 360
+                        gap = (
+                            state["heading"] + closing.turn_angle() - self.start_heading
+                        ) % 360
                         if min(gap, 360 - gap) > ANGLE_TOL:
                             continue
-                        candidate = Construction(state["start"], self.start_heading,
-                            list(state["pieces"]), [closing, *state["joints"]])
+                        candidate = Construction(
+                            state["start"],
+                            self.start_heading,
+                            list(state["pieces"]),
+                            [closing, *state["joints"]],
+                        )
                         candidate = self._add_second_gate(candidate)
                         self.stats.closed_candidates += 1
-                        valid = validate_construction(candidate, self.room, self.inventory)
+                        valid = validate_construction(
+                            candidate, self.room, self.inventory
+                        )
                         if valid.valid:
                             self.stats.valid_polygons += 1
                             score = score_construction(valid, self.weights)
@@ -299,7 +367,7 @@ class Player5(Player):
                     continue
                 expanded.extend(face_extensions(state))
             expanded.sort(key=heuristic)
-            frontier = expanded[:self.beam_width]
+            frontier = expanded[: self.beam_width]
         return best
 
     def _add_second_gate(self, construction):
