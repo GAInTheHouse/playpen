@@ -1,0 +1,19 @@
+{
+  "_description": "A U-shaped corridor, 8 units wide: two 40-tall arms joined by a 40-wide base, with a 24x32 notch open at the top.",
+  "room": [
+    [0, 0],
+    [40, 0],
+    [40, 40],
+    [32, 40],
+    [32, 8],
+    [8, 8],
+    [8, 40],
+    [0, 40]
+  ],
+  "inventory": {
+    "walls": {"5": 6, "6": 4, "7": 4, "8": 3, "10": 3, "12": 2, "14": 2},
+    "gates": {"6": 2, "8": 1, "10": 1},
+    "connectors": {"straight": 20, "right": 20, "diagonal": 12}
+  },
+  "weights": {"A": 2.0, "C": -3.0, "G": 100.0}
+}
