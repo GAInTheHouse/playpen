@@ -6,6 +6,7 @@ from itertools import combinations_with_replacement, product
 from shapely import Polygon
 
 from players.player0 import Player
+from players.player6.diagonal_search import DiagonalSearch
 from players.player6.polygon import find_fit
 from src.enclosure import Construction, score_construction, validate_construction
 from src.pieces import Connector, ConnectorType, Piece, PieceType
@@ -17,6 +18,7 @@ class Player6(Player):
     GATE = 0
     WALL = 1
     SEARCH_SECONDS = 45.0
+    DIAGONAL_SECONDS = 20.0
     STEPS = (
         (1, 0),
         (0, 1),
@@ -647,7 +649,13 @@ class Player6(Player):
 
         # Keep the supplied inventory unchanged, and return the best validated
         # construction before the submission checker's 60-second CPU limit.
-        self._deadline = time.process_time() + self.SEARCH_SECONDS
+        overall_deadline = time.process_time() + self.SEARCH_SECONDS
+        has_diagonals = self.inventory.connectors.get(ConnectorType.DIAGONAL, 0) >= 2
+        self._deadline = (
+            overall_deadline - min(self.DIAGONAL_SECONDS, self.SEARCH_SECONDS)
+            if has_diagonals
+            else overall_deadline
+        )
         self._fit_cache = {}
         self.best_shape = None
         self.best_fit = None
@@ -660,5 +668,24 @@ class Player6(Player):
         self.enumerate_faces()
         self.generate_quads()
         self.generate_quad_shapes()
+
+        # Keep the rectangle/L result as a fallback. Spend only the reserved
+        # time on the other branch's exact 45-degree beam search.
+        seconds_left = overall_deadline - time.process_time()
+        if has_diagonals and seconds_left > 0:
+            diagonal = DiagonalSearch(
+                self.room,
+                self.inventory,
+                self.weights,
+                time_budget=min(self.DIAGONAL_SECONDS, seconds_left),
+                face_library=self.possible_faces or None,
+            ).build_enclosure()
+            if diagonal is not None:
+                result = validate_construction(diagonal, self.room, self.inventory)
+                if result.valid:
+                    score = score_construction(result, self.weights)
+                    if score > self.best_score:
+                        self.best_score = score
+                        self.best_construction = diagonal
 
         return self.best_construction
