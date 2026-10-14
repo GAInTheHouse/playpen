@@ -99,7 +99,9 @@ def place_at_angle(Q, P, theta_deg, eps=1e-9, obstacle_triangles=None):
     return placed, (theta_deg, t.x, t.y)
 
 
-def find_fit(Q, P, n_angles=8, tol=1e-7, max_cpu_seconds=2.0):
+def find_fit(
+    Q, P, n_angles=8, tol=1e-7, max_cpu_seconds=2.0, *, angles=None, stop=None
+):
     """Try at most eight room-oriented angles, with a bounded inner-fit search.
 
     n_angles caps the number of orientations; it no longer defines a uniform
@@ -112,7 +114,9 @@ def find_fit(Q, P, n_angles=8, tol=1e-7, max_cpu_seconds=2.0):
     deadline = process_time() + max_cpu_seconds
     padded_room = Q.buffer(tol)
     prepared_room = prep(padded_room)
-    angles = room_search_angles(Q)[: max(0, min(n_angles, 8))]
+    angles = (room_search_angles(Q) if angles is None else list(angles))[
+        : max(0, min(n_angles, 8))
+    ]
     if not angles:
         return None
 
@@ -134,7 +138,7 @@ def find_fit(Q, P, n_angles=8, tol=1e-7, max_cpu_seconds=2.0):
         )
         for qx, qy in Q.exterior.coords:
             for px, py in anchors:
-                if process_time() >= deadline:
+                if process_time() >= deadline or (stop is not None and stop()):
                     return None
                 tx, ty = qx - px, qy - py
                 if (
@@ -148,7 +152,7 @@ def find_fit(Q, P, n_angles=8, tol=1e-7, max_cpu_seconds=2.0):
                 if prepared_room.covers(placed):
                     return placed, (theta, tx, ty)
 
-    if process_time() >= deadline:
+    if process_time() >= deadline or (stop is not None and stop()):
         return None
     qx0, qy0, qx1, qy1 = Q.bounds
     obstacles = box(qx0, qy0, qx1, qy1).difference(Q)
@@ -156,7 +160,7 @@ def find_fit(Q, P, n_angles=8, tol=1e-7, max_cpu_seconds=2.0):
         t for g in getattr(obstacles, "geoms", [obstacles]) for t in triangles(g)
     ]
     for theta in angles:
-        if process_time() >= deadline:
+        if process_time() >= deadline or (stop is not None and stop()):
             return None
         res = place_at_angle(Q, P, theta, obstacle_triangles=obstacle_triangles)
         if res is None:
