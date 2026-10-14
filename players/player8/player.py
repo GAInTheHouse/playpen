@@ -1,6 +1,7 @@
 import math
+import time
 
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Point, Polygon
 
 from players.player0 import Player
 from src.enclosure import Construction, explain_score, validate_construction
@@ -8,443 +9,702 @@ from src.pieces import Connector, ConnectorType, Piece, PieceType
 
 
 class Player8(Player):
-    """Generate closed shapes with backtracking, then try placing them in the room."""
+    """Find irregular enclosures with beam search and a DFS fallback."""
 
     def build_enclosure(self) -> Construction | None:
-        # Set up for you by Player.__init__:
-        #   self.room       the room footprint (self.room.polygon is a shapely Polygon;
-        #                   self.room.contains_enclosure(polygon) checks a candidate fits)
-        #   self.inventory  the walls, gates and connectors you may use
-        #   self.weights    the scoring weights A, C and G
-        #
-        # Return a Construction describing a closed loop of walls/gates and
-        # connectors, or None for "no solution".
-        #
-        # None scores 0; an invalid Construction scores -1000; a valid one scores
-        # 1000 + A*area + C*perimeter (+ G for a second gate on another face).
-        # So when you are not sure, return None.
-        #
-        # You get 300 s of CPU time for the whole run, including this class's
-        # constructor (--cpu-limit changes it when testing). Past that the run
-        # is stopped and scores 0.
-        #
-        # PLACEMENT_GUIDE.md covers placing a shape in the room; SIMULATOR_GUIDE.md
-        # covers everything else; players/example_player.py is a worked example.
+        BEAM_WIDTH = 4000
+        MAX_PIECES = 18
+        MAX_SHAPES = 30000
+        PLACE_LIMIT = 2500
 
-        # ============================================================
-        # SETTINGS
-        # ============================================================
+        # CPU-time limits, measured from the start of this function.
+        BEAM_SECONDS = 110.0
+        FIRST_PLACEMENT_SECONDS = 150.0
+        DFS_SECONDS = 225.0
+        TOTAL_SECONDS = 275.0
+        EPS = 1e-4
 
-        
-       
+        started = time.process_time()
+        beam_deadline = started + BEAM_SECONDS
+        first_placement_deadline = started + FIRST_PLACEMENT_SECONDS
+        dfs_deadline = started + DFS_SECONDS
+        final_deadline = started + TOTAL_SECONDS
 
-        # Safety limits so backtracking does not explode.
-        MAX_PIECES = 8
-        MAX_BRANCHES = 50000
-        MAX_SHAPES = 300
+        # Updated when DFS starts, so closure lookahead
+        # uses the correct deadline.
+        search_deadline = beam_deadline
 
-        MAX_SHAPES_TO_PLACE = 50
+        room = self.room.polygon
+        walls = dict(self.inventory.walls)
+        gates = dict(self.inventory.gates)
+        connector_stock = dict(self.inventory.connectors)
 
-        # Get room corners, except last since its repeated
-        room_points = list(self.room.polygon.exterior.coords)[:-1]
+        completed = []
+        seen_shapes = set()
 
-        midpoints = []
+        def pieces_left(state):
+            result = []
 
-        # Find midpoint for each neighboring points
-        for i in range(len(room_points)):
-            x1, y1 = room_points[i]
-            x2, y2 = room_points[(i + 1) % len(room_points)]
+            for kind, stock in (
+                (PieceType.GATE, state["gates"]),
+                (PieceType.WALL, state["walls"]),
+            ):
+                for length, count in stock.items():
+                    # The simulator requires lengths >= 5.
+                    if count > 0 and length >= 5:
+                        result.append(Piece(kind, length))
+
+            return result
+
+        def connectors_left(state):
+            stock = state["available"]
+            result = []
+
+            if stock.get(ConnectorType.STRAIGHT, 0) > 0:
+                result.append((Connector(ConnectorType.STRAIGHT), 0))
+
+            if stock.get(ConnectorType.RIGHT, 0) > 0:
+                result.extend(
+                    [
+                        (
+                            Connector(
+                                ConnectorType.RIGHT,
+                                reflex=False,
+                            ),
+                            90,
+                        ),
+                        (
+                            Connector(
+                                ConnectorType.RIGHT,
+                                reflex=True,
+                            ),
+                            -90,
+                        ),
+                    ]
+                )
+
+            if stock.get(ConnectorType.DIAGONAL, 0) > 0:
+                result.extend(
+                    [
+                        (
+                            Connector(
+                                ConnectorType.DIAGONAL,
+                                reflex=False,
+                            ),
+                            45,
+                        ),
+                        (
+                            Connector(
+                                ConnectorType.DIAGONAL,
+                                reflex=True,
+                            ),
+                            -45,
+                        ),
+                    ]
+                )
+
+            return result
+
+        def record(state):
+            if len(completed) >= MAX_SHAPES:
+                return
+
+            if len(state["pieces"]) < 3:
+                return
+
+            if state["gate_count"] == 0:
+                return
+
+            if math.hypot(*state["points"][-1]) > EPS:
+                return
+
+            needed_turn = ((-state["heading"] + 180) % 360) - 180
+
+            closing_connector = next(
+                (
+                    conn
+                    for conn, turn in connectors_left(state)
+                    if abs(turn - needed_turn) < EPS
+                ),
+                None,
+            )
+
+            if closing_connector is None:
+                return
+
+            polygon = Polygon(state["points"][:-1])
+
+            if not polygon.is_valid or polygon.area <= EPS:
+                return
+
+            ordered_connectors = [closing_connector] + state["between"]
+
+            signature = tuple(
+                (
+                    piece.piece_type,
+                    piece.length,
+                    conn.connector_type,
+                    (
+                        conn.reflex
+                        if conn.connector_type != ConnectorType.STRAIGHT
+                        else False
+                    ),
+                )
+                for piece, conn in zip(
+                    state["pieces"],
+                    ordered_connectors,
+                )
+            )
+
+            if signature in seen_shapes:
+                return
+
+            seen_shapes.add(signature)
+
+            approximate_score = (
+                1000
+                + self.weights.A * polygon.area
+                + self.weights.C * polygon.length
+                + (self.weights.G if state["gate_count"] >= 2 else 0)
+            )
+
+            completed.append(
+                (
+                    approximate_score,
+                    state["pieces"],
+                    ordered_connectors,
+                    polygon,
+                )
+            )
+
+        def extend(state, conn, turn, piece):
+            face_length = state["face"] + piece.length if turn == 0 else piece.length
+
+            if face_length > 30:
+                return None
+
+            heading = (state["heading"] + turn) % 360
+
+            x, y = state["points"][-1]
+            angle = math.radians(heading)
+
+            nx = x + piece.length * math.cos(angle)
+            ny = y + piece.length * math.sin(angle)
+
+            if math.hypot(nx, ny) < EPS:
+                nx, ny = 0.0, 0.0
+
+            points = state["points"] + [(nx, ny)]
+
+            if not LineString(points).is_simple:
+                return None
+
+            wl = state["walls"].copy()
+            gl = state["gates"].copy()
+
+            if piece.piece_type == PieceType.GATE:
+                gl[piece.length] -= 1
+            else:
+                wl[piece.length] -= 1
+
+            remaining = state["available"].copy()
+            remaining[conn.connector_type] -= 1
+
+            return {
+                "pieces": state["pieces"] + [piece],
+                "between": state["between"] + [conn],
+                "points": points,
+                "heading": heading,
+                "face": face_length,
+                "walls": wl,
+                "gates": gl,
+                "available": remaining,
+                "gate_count": (
+                    state["gate_count"] + (piece.piece_type == PieceType.GATE)
+                ),
+                "diagonals": (state["diagonals"] + (abs(turn) == 45)),
+            }
+
+        def try_finish(state):
+            """Try closing with one or two more pieces."""
+
+            if time.process_time() >= search_deadline:
+                return
+
+            record(state)
+
+            if len(state["pieces"]) >= MAX_PIECES:
+                return
+
+            x, y = state["points"][-1]
+            distance = math.hypot(x, y)
+
+            # Try closing with one piece.
+            for conn, turn in connectors_left(state):
+                angle = math.radians(state["heading"] + turn)
+
+                if (
+                    abs(x + distance * math.cos(angle)) > EPS
+                    or abs(y + distance * math.sin(angle)) > EPS
+                ):
+                    continue
+
+                for piece in pieces_left(state):
+                    if abs(piece.length - distance) <= EPS:
+                        candidate = extend(
+                            state,
+                            conn,
+                            turn,
+                            piece,
+                        )
+
+                        if candidate is not None:
+                            record(candidate)
+
+            if len(state["pieces"]) + 2 > MAX_PIECES:
+                return
+
+            # Try closing with two pieces.
+            for conn, turn in connectors_left(state):
+                if time.process_time() >= search_deadline:
+                    return
+
+                for piece in pieces_left(state):
+                    penultimate = extend(
+                        state,
+                        conn,
+                        turn,
+                        piece,
+                    )
+
+                    if penultimate is None:
+                        continue
+
+                    px, py = penultimate["points"][-1]
+
+                    if (px, py) == (0.0, 0.0):
+                        record(penultimate)
+                        continue
+
+                    remaining_distance = math.hypot(px, py)
+
+                    desired_heading = math.degrees(math.atan2(-py, -px)) % 360
+
+                    needed_turn = (
+                        (desired_heading - penultimate["heading"] + 180) % 360
+                    ) - 180
+
+                    for final_conn, final_turn in connectors_left(penultimate):
+                        if abs(final_turn - needed_turn) > 0.001:
+                            continue
+
+                        for final_piece in pieces_left(penultimate):
+                            if abs(final_piece.length - remaining_distance) > EPS:
+                                continue
+
+                            closed = extend(
+                                penultimate,
+                                final_conn,
+                                final_turn,
+                                final_piece,
+                            )
+
+                            if closed is not None:
+                                record(closed)
+
+                    if len(completed) >= MAX_SHAPES:
+                        return
+
+        def priority(state):
+            x, y = state["points"][-1]
+
+            heading_turn = abs(((state["heading"] + 180) % 360) - 180)
+
+            return (
+                -0.7 * math.hypot(x, y)
+                + 2 * min(state["diagonals"], 3)
+                + (5 if state["gate_count"] else -5)
+                + min(heading_turn, 135) * 0.045
+                - 0.15 * len(state["pieces"])
+            )
+
+        initial = {
+            "walls": walls,
+            "gates": gates,
+        }
+
+        beam = []
+
+        for first in pieces_left(initial):
+            wl = walls.copy()
+            gl = gates.copy()
+
+            if first.piece_type == PieceType.GATE:
+                gl[first.length] -= 1
+            else:
+                wl[first.length] -= 1
+
+            beam.append(
+                {
+                    "pieces": [first],
+                    "between": [],
+                    "points": [
+                        (0.0, 0.0),
+                        (float(first.length), 0.0),
+                    ],
+                    "heading": 0,
+                    "face": first.length,
+                    "walls": wl,
+                    "gates": gl,
+                    "available": connector_stock.copy(),
+                    "gate_count": int(first.piece_type == PieceType.GATE),
+                    "diagonals": 0,
+                }
+            )
+
+        # Save original starting paths for the DFS fallback.
+        initial_beam = beam.copy()
+
+        for _ in range(1, MAX_PIECES):
+            if (
+                not beam
+                or len(completed) >= MAX_SHAPES
+                or time.process_time() >= search_deadline
+            ):
+                break
+
+            successors = []
+
+            for state in beam:
+                if (
+                    time.process_time() >= search_deadline
+                    or len(completed) >= MAX_SHAPES
+                ):
+                    break
+
+                try_finish(state)
+
+                for conn, turn in connectors_left(state):
+                    if time.process_time() >= search_deadline:
+                        break
+
+                    for piece in pieces_left(state):
+                        candidate = extend(
+                            state,
+                            conn,
+                            turn,
+                            piece,
+                        )
+
+                        if candidate is None:
+                            continue
+
+                        if candidate["points"][-1] == (0.0, 0.0):
+                            record(candidate)
+                        else:
+                            successors.append(candidate)
+
+            if time.process_time() >= search_deadline:
+                break
+
+            # Group paths to preserve different types of shapes.
+            groups_by_key = {}
+
+            for state in successors:
+                x, y = state["points"][-1]
+
+                key = (
+                    state["heading"] // 45,
+                    max(-3, min(3, round(x / 10))),
+                    max(-3, min(3, round(y / 10))),
+                    min(2, state["diagonals"]),
+                    min(2, state["gate_count"]),
+                )
+
+                groups_by_key.setdefault(key, []).append(state)
+
+            for group in groups_by_key.values():
+                group.sort(
+                    key=priority,
+                    reverse=True,
+                )
+
+            groups = sorted(
+                groups_by_key.values(),
+                key=lambda g: priority(g[0]),
+                reverse=True,
+            )
+
+            beam = []
+            seen = set()
+            layer = 0
+
+            # Round-robin selection across different groups.
+            while groups and len(beam) < BEAM_WIDTH:
+                if time.process_time() >= search_deadline:
+                    break
+
+                remaining_groups = []
+
+                for group in groups:
+                    if len(beam) >= BEAM_WIDTH:
+                        break
+
+                    if layer >= len(group):
+                        continue
+
+                    state = group[layer]
+                    x, y = state["points"][-1]
+
+                    signature = (
+                        round(x, 3),
+                        round(y, 3),
+                        state["heading"],
+                        state["face"],
+                        state["gate_count"],
+                        tuple(sorted(state["walls"].items())),
+                        tuple(sorted(state["gates"].items())),
+                        tuple(
+                            sorted((k.value, v) for k, v in state["available"].items())
+                        ),
+                        tuple(
+                            (round(px, 2), round(py, 2))
+                            for px, py in state["points"][-2:]
+                        ),
+                    )
+
+                    if signature not in seen:
+                        seen.add(signature)
+                        beam.append(state)
+
+                    if layer + 1 < len(group):
+                        remaining_groups.append(group)
+
+                groups = remaining_groups
+                layer += 1
+
+        inside = room.representative_point()
+        centers = [(inside.x, inside.y)]
+
+        boundary = list(room.exterior.coords)[:-1]
+
+        for i, (x1, y1) in enumerate(boundary):
+            x2, y2 = boundary[(i + 1) % len(boundary)]
 
             midpoint_x = (x1 + x2) / 2
             midpoint_y = (y1 + y2) / 2
 
-            midpoints.append((midpoint_x, midpoint_y))
-
-        # For every midpoint, we try multiple deterministic jumps toward the inside point to generate candidate centers.
-        inside = self.room.polygon.representative_point()
-        inside_x = inside.x
-        inside_y = inside.y
-
-        candidate_centers = [(inside_x, inside_y)]
-        for midpoint_x, midpoint_y in midpoints:
-            for fraction in [0.2, 0.4, 0.6, 0.8]:
-                x = midpoint_x + fraction * (inside_x - midpoint_x)
-                y = midpoint_y + fraction * (inside_y - midpoint_y)
-
-                candidate_centers.append((x, y))
-
-        walls = dict(self.inventory.walls)
-        gates = dict(self.inventory.gates)
-
-        connector_counts = self.inventory.connectors.copy()
-        shapes = []
-
-        branches_checked = 0
-
-        def backtrack(
-            pieces,
-            connectors_between,
-            points,
-            x,
-            y,
-            heading,
-            current_face_length,
-            walls_left,
-            gates_left,
-            connectors_left,
-            gate_count,
-        ):
-            nonlocal branches_checked
-
-            branches_checked += 1
-
-            # To prevent backtracking from exploding
-            if branches_checked > MAX_BRANCHES:
-                return
-
-            # Stop once we already found enough shapes.
-            if len(shapes) >= MAX_SHAPES:
-                return
-
-            # Need at least 3 pieces to enclose anything
-            if len(shapes) >= MAX_SHAPES_TO_PLACE:
-                return
-            
-            if len(pieces) >= 3:
-                distance_to_start = math.hypot(x, y)
-
-                # Check if we have closed the loop
-                if distance_to_start < 0.001:
-                    # Must contain at least one gate.
-                    if gate_count == 0:
-                        return
-
-                    # Even if we have reached the beginning, need one final connector to connect last piece to first piece
-                    needed_turn = ((-heading + 180) % 360) - 180
-
-                    closing_connector = None
-
-                    if abs(needed_turn - 90) < 0.001:
-                        if connectors_left[ConnectorType.RIGHT] > 0:
-                            closing_connector = Connector(
-                                ConnectorType.RIGHT,
-                                reflex=False,
-                            )
-
-                    elif abs(needed_turn + 90) < 0.001:
-                        if connectors_left[ConnectorType.RIGHT] > 0:
-                            closing_connector = Connector(
-                                ConnectorType.RIGHT,
-                                reflex=True,
-                            )
-
-                    elif abs(needed_turn - 45) < 0.001:
-                        if connectors_left[ConnectorType.DIAGONAL] > 0:
-                            closing_connector = Connector(
-                                ConnectorType.DIAGONAL,
-                                reflex=False,
-                            )
-
-                    elif abs(needed_turn + 45) < 0.001:
-                        if connectors_left[ConnectorType.DIAGONAL] > 0:
-                            closing_connector = Connector(
-                                ConnectorType.DIAGONAL,
-                                reflex=True,
-                            )
-
-                    elif abs(needed_turn) < 0.001:
-                        if connectors_left[ConnectorType.STRAIGHT] > 0:
-                            closing_connector = Connector(ConnectorType.STRAIGHT)
-
-                    # If no connector can close the final corner, shape cannot work
-                    if closing_connector is None:
-                        return
-
-                    connectors = [closing_connector] + connectors_between
-
-                    # Must have exactly one connector per piece.
-                    if len(connectors) != len(pieces):
-                        return
-
-
-                    polygon = Polygon(points[:-1])
-                    if not polygon.is_valid:
-                        return
-                    if not polygon.exterior.is_simple:
-                        return
-                    if polygon.area <= 0:
-                        return
-
-                    # If we have 2 gates, add bonus to our score
-                    approximate_gate_bonus = self.weights.G if gate_count >= 2 else 0
-
-                    approximate_score = (
-                        1000
-                        + self.weights.A * polygon.area
-                        + self.weights.C * polygon.length
-                        + approximate_gate_bonus
-                    )
-
-                    shapes.append(
-                        {
-                            "pieces": pieces.copy(),
-                            "connectors": connectors.copy(),
-                            "polygon": polygon,
-                            "score": approximate_score,
-                        }
-                    )
-
-                    return
-
-            if len(pieces) >= MAX_PIECES:
-                return
-
-            # Fill possible connectors 
-            possible_connectors = []
-
-            # Straight = no turn.
-            if connectors_left[ConnectorType.STRAIGHT] > 0:
-                possible_connectors.append(
+            for fraction in (0.25, 0.5, 0.75):
+                centers.append(
                     (
-                        Connector(ConnectorType.STRAIGHT),
-                        0,
+                        midpoint_x + fraction * (inside.x - midpoint_x),
+                        midpoint_y + fraction * (inside.y - midpoint_y),
                     )
                 )
 
-            # Normal right connector = +90 degrees.
-            if connectors_left[ConnectorType.RIGHT] > 0:
-                possible_connectors.append(
-                    (
-                        Connector(
-                            ConnectorType.RIGHT,
-                            reflex=False,
-                        ),
-                        90,
-                    )
-                )
+        minx, miny, maxx, maxy = room.bounds
 
-                # Flipped right connector = -90 degrees.
-                possible_connectors.append(
-                    (
-                        Connector(
-                            ConnectorType.RIGHT,
-                            reflex=True,
-                        ),
-                        -90,
-                    )
-                )
+        for ix in range(1, 11):
+            for iy in range(1, 11):
+                cx = minx + ix * (maxx - minx) / 11
+                cy = miny + iy * (maxy - miny) / 11
 
-            # Normal diagonal = +45 degrees.
-            if connectors_left[ConnectorType.DIAGONAL] > 0:
-                possible_connectors.append(
-                    (
-                        Connector(
-                            ConnectorType.DIAGONAL,
-                            reflex=False,
-                        ),
-                        45,
-                    )
-                )
+                if room.covers(Point(cx, cy)):
+                    centers.append((cx, cy))
 
-                # Flipped diagonal = -45 degrees.
-                possible_connectors.append(
-                    (
-                        Connector(
-                            ConnectorType.DIAGONAL,
-                            reflex=True,
-                        ),
-                        -45,
-                    )
-                )
+        centers = list(dict.fromkeys((round(x, 4), round(y, 4)) for x, y in centers))
 
-            
-            # Try every possible connector
-            for connector, turn in possible_connectors:
-                next_heading = heading + turn
+        def evaluate(shapes, deadline):
+            if not shapes:
+                return None, 0.0, 0
 
-                new_connectors_left = connectors_left.copy()
-                new_connectors_left[connector.connector_type] -= 1
-
-                # Fill with possible walls and gates
-                possible_pieces = []
-
-                # If we still have no gate, try gates FIRST, to reach valid shapes faster (Need to fact check this claim)
-                if gate_count == 0:
-                    for length, count in gates_left.items():
-                        if count > 0 and length >= 5:
-                            possible_pieces.append(Piece(PieceType.GATE, length))
-
-                for length, count in walls_left.items():
-                    if count > 0 and length >= 5:
-                        possible_pieces.append(Piece(PieceType.WALL, length))
-
-                # Gates are still allowed even if one has already been used.
-                if gate_count > 0:
-                    for length, count in gates_left.items():
-                        if count > 0 and length >= 5:
-                            possible_pieces.append(Piece(PieceType.GATE, length))
-
-                # Try every possible peiece
-                for piece in possible_pieces:
-
-                    if connector.connector_type == ConnectorType.STRAIGHT:
-                        new_face_length = current_face_length + piece.length
-                    else:
-                        new_face_length = piece.length
-
-                    # check Length of 30 rule 
-                    if new_face_length > 30:
-                        continue
-
-                    radians = math.radians(next_heading)
-
-                    new_x = x + piece.length * math.cos(radians)
-                    new_y = y + piece.length * math.sin(radians)
-
-                    new_points = points + [(new_x, new_y)]
-
-                    # Make sure paths dont cross
-                    path = LineString(new_points)
-
-                    if not path.is_simple:
-                        continue
-                    
-                    # Update count of piece used
-                    new_walls_left = walls_left.copy()
-                    new_gates_left = gates_left.copy()
-
-                    new_gate_count = gate_count
-
-                    if piece.piece_type == PieceType.WALL:
-                        new_walls_left[piece.length] -= 1
-                    else:
-                        new_gates_left[piece.length] -= 1
-                        new_gate_count += 1
-
-                    backtrack(
-                        pieces + [piece],
-                        connectors_between + [connector],
-                        new_points,
-                        new_x,
-                        new_y,
-                        next_heading,
-                        new_face_length,
-                        new_walls_left,
-                        new_gates_left,
-                        new_connectors_left,
-                        new_gate_count,
-                    )
-
-
-        first_pieces = []
-
-        # Try gates first because every valid pen needs one.
-        for length, count in gates.items():
-            if count > 0 and length >= 5:
-                first_pieces.append(Piece(PieceType.GATE, length))
-
-        for length, count in walls.items():
-            if count > 0 and length >= 5:
-                first_pieces.append(Piece(PieceType.WALL, length))
-
-        for first_piece in first_pieces:
-            new_walls = walls.copy()
-            new_gates = gates.copy()
-
-            gate_count = 0
-
-            if first_piece.piece_type == PieceType.WALL:
-                new_walls[first_piece.length] -= 1
-            else:
-                new_gates[first_piece.length] -= 1
-                gate_count = 1
-
-            # Heading is 0, so this first piece simply goes right.
-            end_x = first_piece.length
-            end_y = 0
-
-            backtrack(
-                pieces=[first_piece],
-                connectors_between=[],
-                points=[(0, 0), (end_x, end_y)],
-                x=end_x,
-                y=end_y,
-                heading=0,
-                current_face_length=first_piece.length,
-                walls_left=new_walls,
-                gates_left=new_gates,
-                connectors_left=connector_counts.copy(),
-                gate_count=gate_count,
+            ranked = sorted(
+                shapes,
+                key=lambda s: s[0],
+                reverse=True,
             )
 
-        # Check shapes that have the biggest score first
-        shapes.sort(
-            key=lambda shape: shape["score"],
-            reverse=True,
-        )
+            smallest = sorted(
+                shapes,
+                key=lambda s: s[3].area,
+            )
 
-        best_construction = None
-        best_score = -math.inf
+            diagonal = sorted(
+                shapes,
+                key=lambda s: sum(
+                    c.connector_type == ConnectorType.DIAGONAL for c in s[2]
+                ),
+                reverse=True,
+            )
 
-        # Try rotations in 45-degree steps.
-        headings = [
-            0,
-            45,
-            90,
-            135,
-            180,
-            225,
-            270,
-            315,
-        ]
+            chosen = []
+            used = set()
 
-        for shape in shapes[:MAX_SHAPES_TO_PLACE]:
-            polygon = shape["polygon"]
+            for pool, limit in (
+                (ranked, 1500),
+                (smallest, 600),
+                (diagonal, 400),
+            ):
+                picked = 0
 
-            # This is the center of the shape when it was built around (0, 0).
-            shape_center = polygon.centroid
-
-            for center_x, center_y in candidate_centers:
-                for heading in headings:
-                    theta = math.radians(heading)
-
-                    # Vector from the shape center back to its start (0,0).
-                    dx = -shape_center.x
-                    dy = -shape_center.y
-
-                    rotated_dx = dx * math.cos(theta) - dy * math.sin(theta)
-
-                    rotated_dy = dx * math.sin(theta) + dy * math.cos(theta)
-
-                    # Starting point for the Construction.
-                    start = (
-                        center_x + rotated_dx,
-                        center_y + rotated_dy,
-                    )
-
-                    construction = Construction(
-                        start=start,
-                        start_heading=heading,
-                        pieces=shape["pieces"],
-                        connectors=shape["connectors"],
-                    )
-
-                    result = validate_construction(
-                        construction,
-                        self.room,
-                        self.inventory,
-                    )
-
-                    if not result.valid:
+                for candidate in pool:
+                    if id(candidate) in used:
                         continue
 
-                    score = explain_score(
-                        result,
-                        self.weights,
-                    ).total
+                    used.add(id(candidate))
+                    chosen.append(candidate)
+                    picked += 1
 
-                    if score > best_score:
-                        best_score = score
-                        best_construction = construction
+                    if picked >= limit or len(chosen) >= PLACE_LIMIT:
+                        break
 
-        return best_construction
+            best = None
+            best_score = 0.0
+
+            for _, pieces, ordered_connectors, polygon in chosen:
+                if time.process_time() >= deadline:
+                    break
+
+                center = polygon.centroid
+
+                vertices = [
+                    (x - center.x, y - center.y)
+                    for x, y in list(polygon.exterior.coords)[:-1]
+                ]
+
+                for heading in range(0, 360, 15):
+                    if time.process_time() >= deadline:
+                        break
+
+                    angle = math.radians(heading)
+                    cs = math.cos(angle)
+                    sn = math.sin(angle)
+
+                    rotated = [
+                        (
+                            dx * cs - dy * sn,
+                            dx * sn + dy * cs,
+                        )
+                        for dx, dy in vertices
+                    ]
+
+                    start_dx = -center.x * cs + center.y * sn
+
+                    start_dy = -center.x * sn - center.y * cs
+
+                    for cx, cy in centers:
+                        if time.process_time() >= deadline:
+                            break
+
+                        placed = Polygon([(cx + dx, cy + dy) for dx, dy in rotated])
+
+                        if not room.covers(placed):
+                            continue
+
+                        construction = Construction(
+                            start=(
+                                cx + start_dx,
+                                cy + start_dy,
+                            ),
+                            start_heading=heading,
+                            pieces=pieces,
+                            connectors=ordered_connectors,
+                        )
+
+                        result = validate_construction(
+                            construction,
+                            self.room,
+                            self.inventory,
+                        )
+
+                        if not result.valid:
+                            continue
+
+                        score = explain_score(
+                            result,
+                            self.weights,
+                        ).total
+
+                        if score > best_score:
+                            best_score = score
+                            best = construction
+
+            return best, best_score, len(chosen)
+
+        beam_count = len(completed)
+
+        best, best_score, beam_selected = evaluate(
+            completed,
+            first_placement_deadline,
+        )
+
+        print(
+            f"Beam: {beam_count} completed, "
+            f"{beam_selected} selected, "
+            f"best score {best_score:.1f}, "
+            f"CPU {time.process_time() - started:.1f}s"
+        )
+
+        if best is None and time.process_time() < dfs_deadline:
+            print("No positive placement from beam; starting DFS fallback.")
+
+            # Reset completed shapes so beam search does not
+            # prevent DFS from saving its own candidates.
+            completed.clear()
+            seen_shapes.clear()
+
+            search_deadline = dfs_deadline
+
+            # DFS starts again from the original inventory.
+            stack = initial_beam.copy()
+
+            explored = 0
+
+            while stack and time.process_time() < dfs_deadline:
+                if len(completed) >= MAX_SHAPES:
+                    break
+
+                state = stack.pop()
+                explored += 1
+
+                try_finish(state)
+
+                if len(state["pieces"]) >= MAX_PIECES:
+                    continue
+
+                for conn, turn in connectors_left(state):
+                    if time.process_time() >= dfs_deadline:
+                        break
+
+                    for piece in pieces_left(state):
+                        child = extend(
+                            state,
+                            conn,
+                            turn,
+                            piece,
+                        )
+
+                        if child is None:
+                            continue
+
+                        if child["points"][-1] == (0.0, 0.0):
+                            record(child)
+                        else:
+                            stack.append(child)
+
+            dfs_count = len(completed)
+
+            best, best_score, dfs_selected = evaluate(
+                completed,
+                final_deadline,
+            )
+
+            print(
+                f"DFS: explored {explored}, "
+                f"completed {dfs_count}, "
+                f"selected {dfs_selected}, "
+                f"best score {best_score:.1f}, "
+                f"CPU {time.process_time() - started:.1f}s"
+            )
+
+        return best
