@@ -1,6 +1,7 @@
 import math
 import random
 import tkinter as tk
+from tkinter import font as tkfont
 
 import src.constants as c
 from players.player0 import Player, PlayerException
@@ -9,6 +10,7 @@ from src.args import Args
 from src.enclosure import (
     Construction,
     explain_score,
+    inventory_usage,
     score_construction,
     sketch_points,
     unavailable_items,
@@ -21,6 +23,23 @@ from src.scenario import Scenario, generate_scenario, read_scenario, write_scena
 # resize; the result panel is wiped and redrawn on every click.
 ENCLOSURE_TAG = "enclosure"
 STATIC_TAG = "static"
+
+
+def player_label(name: str | None) -> str:
+    """What to call the selected player on screen: "Player 3" for a group's."""
+    if name is None:
+        return "No player (sandbox)"
+    if name.isdigit():
+        return f"Player {name}"
+    if name == "e":
+        return "Example player"
+    if name == "i":
+        return "Invalid-examples demo"
+    if name.startswith("i") and name[1:].isdigit():
+        return f"Invalid example {name[1:]}"
+    return name
+
+
 RESULT_TAG = "result"
 
 TOOLTIP_TAG = "tooltip"
@@ -101,6 +120,7 @@ class Game:
         self.player: Player | None = None
         self.cpu_used: float | None = None  # CPU time of the last run
         self.timeout_message: str | None = None  # set if the last run timed out
+        self.inventory_box: tk.Text | None = None  # the scrollable inventory list
 
         if self.args.gui:
             self._build_gui()
@@ -122,7 +142,7 @@ class Game:
     def _build_gui(self):
         self.root = tk.Tk()
         self.root.withdraw()  # stay hidden until fully built and drawn
-        self.root.title("Playpen")
+        self.root.title(f"Playpen - {player_label(self.args.player)}")
 
         # The info panel is packed FIRST. Tk's pack gives space to widgets in
         # the order they were packed, so if the window ever ends up smaller
@@ -132,8 +152,17 @@ class Game:
         self.right_frame.pack(side="right", fill="y")
         self.right_frame.pack_propagate(False)
 
-        self.info = tk.Canvas(self.right_frame, bg=c.INFO_BG, highlightthickness=0)
+        self.info = tk.Canvas(
+            self.right_frame, bg=c.INFO_BG, highlightthickness=0, yscrollincrement=20
+        )
         self.info.pack(fill="both", expand=True, padx=10, pady=10)
+        # If the window is too short for everything in the panel (a small
+        # screen), the panel scrolls with the mouse wheel rather than cutting
+        # content off.
+        self.info.bind("<Configure>", lambda _event: self._update_panel_scroll())
+        self.info.bind("<MouseWheel>", self._on_panel_wheel)
+        self.info.bind("<Button-4>", lambda _event: self.info.yview_scroll(-1, "units"))
+        self.info.bind("<Button-5>", lambda _event: self.info.yview_scroll(1, "units"))
 
         self.canvas = tk.Canvas(
             self.root,
@@ -523,7 +552,7 @@ class Game:
         return self.info.bbox(item)[3] + gap
 
     def _divider(self, y: float) -> float:
-        line_y = y + 8
+        line_y = y + 5
         self.info.create_line(
             PANEL_MARGIN,
             line_y,
@@ -532,7 +561,7 @@ class Game:
             fill=c.DIVIDER_COLOR,
             tags=self._tag,
         )
-        return line_y + 12
+        return line_y + 9
 
     def _section_header(self, y: float, text: str) -> float:
         font = ("Arial", c.SMALL_FONT_SIZE, "bold")
@@ -625,12 +654,166 @@ class Game:
             )
         y = self._divider(y)
         bold = ("Arial", c.FONT_SIZE, "bold")
-        return self._row(y, "SCORE", _plain(breakdown.total), color, bold)
+        if breakdown.total >= 0:
+            return self._row(y, "SCORE", _plain(breakdown.total), color, bold)
+
+        # negative: red text on a red-tinted band, so it can't be missed
+        before = set(self.info.find_withtag(RESULT_TAG))
+        bottom = self._row(y, "SCORE", _plain(breakdown.total), c.BAD_COLOR, bold)
+        items = set(self.info.find_withtag(RESULT_TAG)) - before
+        _, y0, _, y1 = self.info.bbox(*items)
+        band = self.info.create_rectangle(
+            PANEL_MARGIN - 8,
+            y0 - 4,
+            PANEL_MARGIN + self._panel_width() + 8,
+            y1 + 4,
+            fill=c.NEGATIVE_BG,
+            outline=c.BAD_COLOR,
+            tags=RESULT_TAG,
+        )
+        self.info.tag_lower(band, min(items))
+        return bottom + 8
+
+    def _update_panel_scroll(self):
+        """Let the info panel scroll exactly as far as its content needs (and
+        not at all if everything fits)."""
+        items = self.info.find_all()
+        if not items:
+            return
+        bottom = max(self.info.bbox(item)[3] for item in items) + 12
+        height = max(self.info.winfo_height(), 1)
+        self.info.configure(
+            scrollregion=(
+                0,
+                0,
+                self._panel_width() + 2 * PANEL_MARGIN,
+                max(bottom, height),
+            )
+        )
+        if bottom <= height:
+            self.info.yview_moveto(0)
+
+    def _on_panel_wheel(self, event):
+        if self.info.yview() == (0.0, 1.0):
+            return  # everything fits: nothing to scroll
+        # macOS reports small deltas, Windows multiples of 120
+        units = -event.delta // 120 if abs(event.delta) >= 120 else -event.delta
+        self.info.yview_scroll(int(units), "units")
+
+    def _build_inventory_box(self, y: float) -> float:
+        """A small scrollable box listing everything in the inventory; returns
+        the y below it. `_render_inventory` fills it in."""
+        frame = tk.Frame(
+            self.info,
+            bg=c.INFO_BG,
+            highlightbackground=c.DIVIDER_COLOR,
+            highlightcolor=c.DIVIDER_COLOR,
+            highlightthickness=1,
+        )
+        scrollbar = tk.Scrollbar(frame, orient="vertical")
+        mono = tkfont.nametofont("TkFixedFont").copy()
+        mono.configure(size=c.SMALL_FONT_SIZE)
+        mono_bold = mono.copy()
+        mono_bold.configure(weight="bold")
+        box = tk.Text(
+            frame,
+            width=1,
+            height=1,
+            wrap="none",
+            font=mono,
+            bg=c.INFO_BG,
+            fg=c.TEXT_COLOR,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            padx=6,
+            pady=4,
+            cursor="arrow",
+            takefocus=0,
+            yscrollcommand=scrollbar.set,
+        )
+        scrollbar.configure(command=box.yview)
+        scrollbar.pack(side="right", fill="y")
+        box.pack(side="left", fill="both", expand=True)
+
+        # explicit colors on every tag: never rely on theme defaults here
+        box.tag_configure(
+            "heading", font=mono_bold, foreground=c.SECTION_HEADER_COLOR, spacing1=2
+        )
+        box.tag_configure(
+            "chosen",
+            font=mono_bold,
+            background=c.INVENTORY_CHOSEN_BG,
+            foreground=c.TEXT_COLOR,
+        )
+        box.tag_configure(
+            "short", font=mono_bold, background=c.NEGATIVE_BG, foreground=c.BAD_COLOR
+        )
+
+        self.info.create_window(
+            PANEL_MARGIN,
+            y,
+            anchor="nw",
+            window=frame,
+            width=self._panel_width(),
+            height=c.INVENTORY_BOX_HEIGHT,
+            tags=STATIC_TAG,
+        )
+        self.inventory_box = box
+        self._render_inventory(None)
+        return y + c.INVENTORY_BOX_HEIGHT + 8
+
+    def _render_inventory(self, construction: Construction | None):
+        """List every inventory item; highlight the ones `construction` uses
+        (and, in red, any it wants more of than the inventory has)."""
+        box = self.inventory_box
+        if box is None:
+            return
+        rows = inventory_usage(construction, self.scenario.inventory)
+        box.configure(state="normal")
+        box.delete("1.0", "end")
+        first_used = None
+        for title, kind in (
+            ("walls", "wall"),
+            ("gates", "gate"),
+            ("connectors", "connector"),
+        ):
+            box.insert("end", f"{title.upper()}\n", "heading")
+            group = [row for row in rows if row.kind == kind]
+            if not group:
+                box.insert("end", "  (none)\n")
+            for row in group:
+                name = f"{row.key} units" if kind != "connector" else str(row.key)
+                line = f"  {name:<10} x{row.available}"
+                if row.used:
+                    line += f"   using {row.used}"
+                if row.short:
+                    line += f"  ({row.short} short)"
+                tag = "short" if row.short else "chosen" if row.used else ""
+                if row.used and first_used is None:
+                    first_used = box.index("end-1c linestart")
+                box.insert("end", line.ljust(44) + "\n", tag)
+        box.configure(state="disabled")
+        # scroll so the first highlighted row is in view
+        box.see(first_used or "1.0")
+        if first_used is None:
+            box.yview_moveto(0)
 
     def _draw_static_info_panel(self):
         self._tag = STATIC_TAG
         y = 16
+        top = y
         y = self._put(y, "Playpen", ("Arial", c.TITLE_FONT_SIZE, "bold"), c.TEXT_COLOR)
+        self.info.create_text(
+            PANEL_MARGIN + self._panel_width(),
+            (top + y) / 2,
+            text=player_label(self.args.player),
+            anchor="e",
+            width=self._panel_width() - 120,
+            font=("Arial", c.FONT_SIZE, "bold"),
+            fill=c.SECTION_HEADER_COLOR,
+            tags=STATIC_TAG,
+        )
         y = self._divider(y)
 
         room = self.scenario.room
@@ -638,6 +821,10 @@ class Game:
         y = self._section_header(y, "Room size")
         y = self._stat(y, f"{maxx - minx:.1f} × {maxy - miny:.1f} units")
         y = self._body(y, f"({room.polygon.area:.1f} units²)")
+        y = self._divider(y)
+
+        y = self._section_header(y, "Inventory (highlighted = used)")
+        y = self._build_inventory_box(y)
         y = self._divider(y)
 
         if not self.args.sandbox:
@@ -658,7 +845,20 @@ class Game:
     def draw_result(self):
         self._tag = RESULT_TAG
         self.info.delete(RESULT_TAG)
+        self._render_inventory(None if self.timeout_message else self.construction)
+        self._draw_result_items()
+        # Draw the full per-piece list first; if that makes the panel overflow,
+        # draw it again with the pieces packed into one line. (Measured, not
+        # guessed. Before the window is on screen its height is unknown, so
+        # then assume there's room.)
+        height = self.info.winfo_height()
+        bbox = self.info.bbox(RESULT_TAG)
+        if height >= 100 and bbox and bbox[3] + 12 > height:
+            self.info.delete(RESULT_TAG)
+            self._draw_result_items(compact=True)
+        self._update_panel_scroll()
 
+    def _draw_result_items(self, compact: bool = False):
         y = self._section_header(self.result_start_y, "Result")
 
         note = None if self.timeout_message else getattr(self.player, "note", None)
@@ -719,25 +919,7 @@ class Game:
             else f"Walls placed ({len(pieces)})",
         )
         small = ("Arial", c.SMALL_FONT_SIZE)
-        # One line per piece if that still leaves room for the score below it;
-        # otherwise pack them into one wrapped line so nothing runs off the
-        # bottom. (Before the window is on screen its height isn't known yet,
-        # so assume there's room.)
-        available = self.info.winfo_height()
-        if available < 100:
-            available = float("inf")
-        list_y = y
-        for i, piece in enumerate(pieces):
-            kind = "gate" if piece.is_gate else "wall"
-            fill = c.GATE_COLOR if piece.is_gate else c.TEXT_COLOR
-            text = f"{kind}: {piece.length} units"
-            if i in short_pieces:
-                text += " \u2014 not in inventory"
-                fill = c.BAD_COLOR
-            list_y = self._put(list_y, text, small, fill, gap=1, extra_tag="pieces")
-        room_for_score = 200  # the score calculation that goes below the list
-        if list_y + room_for_score > available:
-            self.info.delete("pieces")
+        if compact:
             listing = "  \u00b7  ".join(
                 f"{'gate' if p.is_gate else 'wall'} {p.length}"
                 + (" (not in inventory)" if i in short_pieces else "")
@@ -745,7 +927,14 @@ class Game:
             )
             y = self._put(y, listing, small, c.TEXT_COLOR, gap=4)
         else:
-            y = list_y
+            for i, piece in enumerate(pieces):
+                kind = "gate" if piece.is_gate else "wall"
+                fill = c.GATE_COLOR if piece.is_gate else c.TEXT_COLOR
+                text = f"{kind}: {piece.length} units"
+                if i in short_pieces:
+                    text += " \u2014 not in inventory"
+                    fill = c.BAD_COLOR
+                y = self._put(y, text, small, fill, gap=1)
 
         y = self._divider(y)
         self._draw_score_calculation(y, color)

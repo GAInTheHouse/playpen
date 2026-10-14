@@ -2,6 +2,9 @@ import heapq
 import math
 import time
 
+from itertools import islice
+from players.player10.polish import Polisher
+
 import src.constants as c
 from players.player0 import Player
 from players.player10.assign import Assigner, Assignment
@@ -27,6 +30,7 @@ from players.player10.shapes import (
 )
 from src.enclosure import Construction, score_construction, validate_construction
 from src.pieces import Connector, ConnectorType, Piece, PieceType
+from players.player10.freeform import free_shapes
 
 # CPU seconds the search may use. Nothing can interrupt a player on Windows, so
 # the player has to stop itself well inside the simulator's limit.
@@ -46,6 +50,9 @@ FALLBACK_BUDGET = 3.0
 FALLBACK_SHAPES = 40
 RECENT_FAILURES = 400
 SHRINK_STEPS = 4
+FREE_BUDGET = 40.0
+POLISH_BUDGET = 20.0  # CPU seconds for the polish pass
+POLISH_TRIES = 300  # candidates tried per round before giving up
 
 Candidate = tuple[float, str, tuple[int, ...]]
 
@@ -58,6 +65,9 @@ class Player10(Player):
     def build_enclosure(self) -> Construction | None:
         self._best: Construction | None = None
         self._best_score = 0.0  # a valid enclosure can score below 0; None is 0
+        self._best_shape: Shape | None = None
+        self._best_start: tuple[float, float] = (0.0, 0.0)
+        self._best_heading = 0.0
         try:
             self._build()
         except Exception as e:  # noqa: BLE001 -- a crash would end the whole run
