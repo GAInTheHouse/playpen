@@ -10,12 +10,13 @@ Return the best loop seen, or None if no rectangle fits.
 """
 
 import functools
+import itertools
 import math
 import os
 import random
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
-from typing import Iterator
 
 import shapely
 from shapely.geometry import Point
@@ -378,7 +379,7 @@ def initial_solutions(
     ring = list(room.polygon.exterior.coords)
     wall_directions = {
         round(math.degrees(math.atan2(y2 - y1, x2 - x1)) % 90, 6) + quarter
-        for (x1, y1), (x2, y2) in zip(ring, ring[1:])
+        for (x1, y1), (x2, y2) in itertools.pairwise(ring)
         for quarter in (0, 90, 180, 270)
     }
     min_x, min_y, max_x, max_y = room.polygon.bounds
