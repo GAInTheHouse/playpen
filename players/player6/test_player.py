@@ -206,34 +206,53 @@ class IterativeFitRegressionTests(unittest.TestCase):
     def test_one_straight_allows_exactly_two_pieces(self):
         for count in (0, 1):
             with self.subTest(straights=count):
-                player = self.make_player(Inventory(
-                    walls={5: 4}, gates={5: 1},
-                    connectors={ConnectorType.RIGHT: 4, ConnectorType.STRAIGHT: count},
-                ))
+                player = self.make_player(
+                    Inventory(
+                        walls={5: 4},
+                        gates={5: 1},
+                        connectors={
+                            ConnectorType.RIGHT: 4,
+                            ConnectorType.STRAIGHT: count,
+                        },
+                    )
+                )
                 player.enumerate_faces(max_length=11)
                 self.assertEqual(10 in player.possible_faces, count == 1)
 
     def test_gate_bonus_counts_distinct_actual_faces(self):
-        shape = make_shape([
-            [(Player6.GATE, 5), (Player6.GATE, 5)], [(Player6.WALL, 5)],
-            [(Player6.WALL, 10)], [(Player6.WALL, 5)],
-        ], [90] * 4)
+        shape = make_shape(
+            [
+                [(Player6.GATE, 5), (Player6.GATE, 5)],
+                [(Player6.WALL, 5)],
+                [(Player6.WALL, 10)],
+                [(Player6.WALL, 5)],
+            ],
+            [90] * 4,
+        )
         player = self.make_player(inventory_for(shape))
         score = player._consider_shape(shape, (shape.to_polygon(), (0, 0, 0)))
         self.assertEqual(score, 1010)
-        result = validate_construction(player.best_construction, player.room, player.inventory)
+        result = validate_construction(
+            player.best_construction, player.room, player.inventory
+        )
         self.assertFalse(result.second_gate_bonus)
 
     def test_failed_l_does_not_prune_smaller_feasible_l(self):
         target = Polygon([(0, 0), (5, 0), (5, 8), (15, 8), (15, 15), (0, 15)])
-        player = self.make_player(Inventory(
-            walls={8: 2, 7: 2, 10: 2}, gates={5: 2},
-            connectors={ConnectorType.RIGHT: 6, ConnectorType.STRAIGHT: 2},
-        ), Room(target))
-        player.possible_faces = {15: [
-            [(Player6.WALL, 8), (Player6.WALL, 7)],
-            [(Player6.GATE, 5), (Player6.WALL, 10)],
-        ]}
+        player = self.make_player(
+            Inventory(
+                walls={8: 2, 7: 2, 10: 2},
+                gates={5: 2},
+                connectors={ConnectorType.RIGHT: 6, ConnectorType.STRAIGHT: 2},
+            ),
+            Room(target),
+        )
+        player.possible_faces = {
+            15: [
+                [(Player6.WALL, 8), (Player6.WALL, 7)],
+                [(Player6.GATE, 5), (Player6.WALL, 10)],
+            ]
+        }
         checked = []
 
         def fit(room, polygon):
@@ -244,19 +263,29 @@ class IterativeFitRegressionTests(unittest.TestCase):
             player.generate_quad_shapes()
         self.assertTrue(any(polygon.equals(target) for polygon in checked))
         self.assertIsNotNone(player.best_construction)
-        result = validate_construction(player.best_construction, player.room, player.inventory)
+        result = validate_construction(
+            player.best_construction, player.room, player.inventory
+        )
         self.assertTrue(result.valid, result.reason)
 
     def test_l_shape_cannot_overspend_straight_connectors(self):
-        shape = make_shape([
-            [(Player6.GATE, 5)], [(Player6.WALL, 5)], [(Player6.WALL, 5)],
-            [(Player6.WALL, 5)], [(Player6.WALL, 5), (Player6.WALL, 5)],
-            [(Player6.WALL, 5), (Player6.WALL, 5)],
-        ], [90, -90, 90, 90, 90, 90])
+        shape = make_shape(
+            [
+                [(Player6.GATE, 5)],
+                [(Player6.WALL, 5)],
+                [(Player6.WALL, 5)],
+                [(Player6.WALL, 5)],
+                [(Player6.WALL, 5), (Player6.WALL, 5)],
+                [(Player6.WALL, 5), (Player6.WALL, 5)],
+            ],
+            [90, -90, 90, 90, 90, 90],
+        )
         inventory = inventory_for(shape)
         inventory.connectors[ConnectorType.STRAIGHT] = 1
         player = self.make_player(inventory)
-        self.assertIsNone(player._consider_shape(shape, (shape.to_polygon(), (0, 0, 0))))
+        self.assertIsNone(
+            player._consider_shape(shape, (shape.to_polygon(), (0, 0, 0)))
+        )
         self.assertIsNone(player.best_construction)
 
     def test_gate_only_inventory_and_input_preservation(self):
@@ -265,14 +294,20 @@ class IterativeFitRegressionTests(unittest.TestCase):
         )
         player = self.make_player(inventory)
         original = inventory.copy()
-        with patch("players.player6.player.find_fit", side_effect=lambda q, p: (p, (0, 0, 0))):
+        with patch(
+            "players.player6.player.find_fit", side_effect=lambda q, p: (p, (0, 0, 0))
+        ):
             construction = player.build_enclosure()
         self.assertIsNotNone(construction)
         self.assertEqual(inventory, original)
-        self.assertTrue(validate_construction(construction, player.room, inventory).valid)
+        self.assertTrue(
+            validate_construction(construction, player.room, inventory).valid
+        )
 
     def test_missing_gate_returns_none(self):
-        player = self.make_player(Inventory(walls={5: 4}, connectors={ConnectorType.RIGHT: 4}))
+        player = self.make_player(
+            Inventory(walls={5: 4}, connectors={ConnectorType.RIGHT: 4})
+        )
         self.assertIsNone(player.build_enclosure())
 
 
