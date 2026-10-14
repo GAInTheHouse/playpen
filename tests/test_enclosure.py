@@ -8,6 +8,7 @@ from src.enclosure import (
     EnclosureError,
     compute_faces,
     explain_score,
+    inventory_usage,
     score_construction,
     sketch_points,
     unavailable_items,
@@ -297,6 +298,83 @@ def test_validation_reports_the_first_unavailable_item():
     result = validate_construction(rectangle_construction(10, 6), BIG_ROOM, inventory)
     assert not result.valid
     assert "wall(10)" in result.reason  # same message as before the refactor
+
+
+def _rows(construction, inventory):
+    return [
+        (r.kind, r.key, r.available, r.used)
+        for r in inventory_usage(construction, inventory)
+    ]
+
+
+def test_inventory_usage_lists_everything_and_marks_what_is_used():
+    inventory = Inventory(
+        walls={10: 6, 6: 2, 13: 1},
+        gates={10: 1},
+        connectors={ConnectorType.RIGHT: 4, ConnectorType.STRAIGHT: 12},
+    )
+    con = rectangle_construction(10, 6, gate_side=0)  # gate 10, walls 6, 10, 6; 4 RIGHT
+    assert _rows(con, inventory) == [
+        ("wall", 6, 2, 2),
+        ("wall", 10, 6, 1),
+        ("wall", 13, 1, 0),
+        ("gate", 10, 1, 1),
+        ("connector", "straight", 12, 0),
+        ("connector", "right", 4, 4),
+        ("connector", "diagonal", 0, 0),  # all three types are always listed
+    ]
+
+
+def test_inventory_usage_with_nothing_built_uses_nothing():
+    inventory = Inventory(
+        walls={10: 6}, gates={8: 1}, connectors={ConnectorType.RIGHT: 4}
+    )
+    assert all(r.used == 0 for r in inventory_usage(None, inventory))
+    assert [(r.kind, r.key) for r in inventory_usage(None, inventory)] == [
+        ("wall", 10),
+        ("gate", 8),
+        ("connector", "straight"),
+        ("connector", "right"),
+        ("connector", "diagonal"),
+    ]
+
+
+def test_inventory_usage_reports_shortages_and_pieces_the_inventory_lacks_entirely():
+    inventory = Inventory(walls={13: 1}, gates={}, connectors={ConnectorType.RIGHT: 3})
+    con = Construction(
+        start=(0, 0),
+        start_heading=0.0,
+        pieces=[
+            Piece(PieceType.WALL, 13),
+            Piece(PieceType.WALL, 13),  # only one in stock
+            Piece(PieceType.GATE, 8),  # no gates at all
+            Piece(PieceType.WALL, 99),  # no such wall
+        ],
+        connectors=[Connector(ConnectorType.RIGHT)] * 4,  # one more than in stock
+    )
+    rows = {(r.kind, r.key): r for r in inventory_usage(con, inventory)}
+    assert (
+        rows["wall", 13].available,
+        rows["wall", 13].used,
+        rows["wall", 13].short,
+    ) == (1, 2, 1)
+    assert (rows["gate", 8].available, rows["gate", 8].short) == (0, 1)
+    assert (rows["wall", 99].available, rows["wall", 99].short) == (0, 1)
+    assert rows["connector", "right"].short == 1
+    assert rows["connector", "straight"].short == 0
+
+
+def test_inventory_usage_counts_a_flipped_connector_under_its_type_and_leaves_the_inventory_alone():
+    inventory = Inventory(
+        walls={10: 6}, gates={10: 1}, connectors={ConnectorType.RIGHT: 6}
+    )
+    con = rectangle_construction(10, 10)
+    con.connectors[1] = Connector(ConnectorType.RIGHT, reflex=True)
+    rows = {(r.kind, r.key): r for r in inventory_usage(con, inventory)}
+    assert rows["connector", "right"].used == 4
+    assert inventory.walls == {10: 6} and inventory.connectors == {
+        ConnectorType.RIGHT: 6
+    }
 
 
 ALL_TESTS = [v for k, v in list(globals().items()) if k.startswith("test_")]

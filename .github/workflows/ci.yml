@@ -35,9 +35,12 @@ jobs:
 
       # separate, and not blocking: window tests are the most likely to behave
       # differently on a headless Linux machine than on a laptop
-      - name: GUI layout tests
+      - name: GUI tests
         continue-on-error: true
-        run: xvfb-run -a uv run python -m tests.test_gui_layout
+        run: |
+          for t in test_gui_layout test_gui_inventory; do
+            xvfb-run -a uv run python -m tests.$t
+          done
 
   submission:
     name: group submission check
