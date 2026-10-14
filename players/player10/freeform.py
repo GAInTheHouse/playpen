@@ -10,6 +10,8 @@ the loop closes iff the lengths walked along each of the axes 0/45/90/135 cancel
 
 Pieces are not tracked here; closed shapes are handed to Assigner.assign, which
 works for any list of face lengths.
+
+Beam search logic after finding 4 shapes
 """
 
 import heapq
