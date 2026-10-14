@@ -2,6 +2,7 @@ import math
 import time
 from collections import Counter
 
+from shapely import affinity
 from shapely.geometry import Point, Polygon, box
 from shapely.ops import polylabel
 from shapely.prepared import prep
@@ -22,15 +23,17 @@ RIGHT = [Connector(ConnectorType.RIGHT)] * 4
 DIAGONAL = [Connector(ConnectorType.DIAGONAL)] * 8
 
 # shape search (edge-list beam search) tuning
-SEARCH_CPU_BUDGET = 45.0  # seconds of CPU the shape search may spend
+SEARCH_CPU_BUDGET = 60.0  # seconds of CPU the shape search may spend
 OCT_PLACEMENTS = 1500  # octagon candidates tried for placement before giving up
 OCT_HEADINGS = [i * 7.5 for i in range(6)]  # rotations in [0, 45) when placing
+# tilts for starting rectangles; turning w x h by 90 gives h x w, so [0, 90)
+RECT_HEADINGS = [i * 7.5 for i in range(12)]
 OCT_GRID = 12  # grid of candidate centers (per axis) for placing octagons
 OCT_ANCHORS = 12  # deepest centers tried per octagon
 POS_STEP = 1.0  # smallest grid step (units) when scanning rectangle positions
 POS_MAX_STEPS = 32  # cap positions per axis so big rooms stay fast
-MAX_ARMS = 8  # beam levels: each level adds one tab (one concave corner)
-BEAM_WIDTH = 4  # shapes kept per level (level 0 = the best rectangles)
+MAX_ARMS = 30  # beam levels: each level adds one tab (one concave corner)
+BEAM_WIDTH = 4  # shapes kept per level (and per kind of starting shape)
 BEAM_EVAL = 24  # children fully validated per level before moving on
 ALLOC_NODES = 2000  # backtracking budget when assigning pieces to faces
 
@@ -343,13 +346,12 @@ class Player7(Player):
     # ---- shape search (edge-list beam search, right and 45-degree faces) ----
 
     def _search(self):
-        """Beam search over buildable shapes. Level 0 is the best few starting
-        shapes: axis-aligned rectangles plus octilinear octagons (any face may be
-        missing, so hexagons, parallelograms and rotated rectangles too) at
-        several rotations. Each level adds one tab (one more concave corner) to
-        every shape in the beam and keeps the best BEAM_WIDTH results, even when
-        they score below their parent, so the search can pass through a worse
-        intermediate shape. The best shape seen at any level wins."""
+        """Beam search over buildable shapes, run twice and the better result
+        kept. The first run starts from straight rectangles and octilinear
+        octagons (any face may be missing, so hexagons and tilted rectangles
+        too, at several tilts). The second starts from tilted rectangles and
+        uses whatever time is left; keeping it separate means tilting can only
+        add to what the first run finds, never crowd its shapes out."""
         if not self.inventory.has_gate():
             return None
         coins = [
@@ -376,10 +378,25 @@ class Player7(Player):
         self._decomp_cache = {}
 
         deadline = time.process_time() + SEARCH_CPU_BUDGET
+        rectangles = self.inventory.connectors.get(ConnectorType.RIGHT, 0) >= 4
         starts = []
-        if self.inventory.connectors.get(ConnectorType.RIGHT, 0) >= 4:
-            starts += self._best_rectangles(deadline, BEAM_WIDTH)
+        if rectangles:
+            starts += self._best_rectangles(deadline, BEAM_WIDTH, [0.0])
         starts += self._octilinear_bases(deadline, BEAM_WIDTH)
+        best = self._beam(starts, deadline)
+        if rectangles:
+            tilted = self._best_rectangles(deadline, BEAM_WIDTH, RECT_HEADINGS[1:])
+            other = self._beam(tilted, deadline)
+            if best is None or (other is not None and other[0] > best[0]):
+                best = other
+        return best[2] if best else None
+
+    def _beam(self, starts, deadline):
+        """Level 0 is `starts`. Each level adds one tab (one more concave
+        corner) to every shape in the beam and keeps the best BEAM_WIDTH
+        results, even when they score below their parent, so the search can
+        pass through a worse intermediate shape. Returns the best (score,
+        vertices, construction) seen at any level, or None."""
         beam = [(score, _clean(verts), cons) for verts, cons, score in starts]
         best = max(beam, key=lambda s: s[0], default=None)
         for _level in range(MAX_ARMS):
@@ -412,52 +429,66 @@ class Player7(Player):
             for state in beam:
                 if best is None or state[0] > best[0]:
                     best = state
-        return best[2] if best else None
+        return best
 
-    def _best_rectangles(self, deadline, k):
-        """Up to k highest-scoring buildable axis-aligned rectangles that fit,
-        each placed most centrally. Returns [(vertices, construction, score)]."""
-        minx, miny, maxx, maxy = self.room.polygon.bounds
-        bbx, bby = maxx - minx, maxy - miny
+    def _best_rectangles(self, deadline, k, headings):
+        """Up to k highest-scoring buildable rectangles that fit, each at the
+        first tilt in `headings` where it fits, placed most centrally. To
+        tilt, we turn the room the other way and search it axis-aligned, then
+        turn the rectangle back. Returns [(vertices, construction, score)]."""
+        room = self.room.polygon
+        # radius of the largest disk the room holds (polylabel is within 0.25)
+        reach = room.exterior.distance(polylabel(room, tolerance=0.25)) + 0.25
+        frames = []
+        for heading in headings:
+            turned = affinity.rotate(room, -heading, origin=(0, 0))
+            frames.append((heading, prep(turned), turned.bounds, turned.centroid))
         A, C = self.weights.A, self.weights.C
         pairs = []
         for w in self._buildables:
-            if w > bbx + 1e-9:
-                continue
             for h in self._buildables:
-                if h > bby + 1e-9:
-                    continue
                 if w not in self._hostable and h not in self._hostable:
                     continue  # neither side could carry the gate
+                if min(w, h) / 2 > reach or w * h > room.area:
+                    continue  # its inscribed disk, or its area, can't fit
                 est = A * w * h + C * 2 * (w + h)
                 pairs.append((est, w, h))
         pairs.sort(reverse=True)
 
         out = []
         for _est, w, h in pairs:
-            if time.process_time() > deadline:
+            if len(out) >= k or time.process_time() > deadline:
                 break
-            pos = self._fit_rect(minx, miny, maxx, maxy, w, h)
-            if pos is None:
-                continue
-            x, y = pos
-            verts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
-            construction = self._to_construction(verts)
-            if construction is None:
-                continue
-            result = validate_construction(construction, self.room, self.inventory)
-            if result.valid:
-                out.append(
-                    (verts, construction, score_construction(result, self.weights))
-                )
-                if len(out) >= k:
-                    break
+            for heading, turned_prep, bounds, centroid in frames:
+                minx, miny, maxx, maxy = bounds
+                if w > maxx - minx + 1e-9 or h > maxy - miny + 1e-9:
+                    continue  # wider or taller than the turned room itself
+                pos = self._fit_rect(turned_prep, bounds, centroid, w, h)
+                if pos is None:
+                    continue
+                x, y = pos
+                t = math.radians(heading)
+                ct, st = math.cos(t), math.sin(t)
+                verts = [
+                    (px * ct - py * st, px * st + py * ct)
+                    for px, py in ((x, y), (x + w, y), (x + w, y + h), (x, y + h))
+                ]
+                construction = self._to_construction(verts)
+                if construction is None:
+                    break  # this size can't be built at any tilt
+                result = validate_construction(construction, self.room, self.inventory)
+                if result.valid:
+                    score = score_construction(result, self.weights)
+                    out.append((verts, construction, score))
+                    break  # one placement per size
         return out
 
-    def _fit_rect(self, minx, miny, maxx, maxy, w, h):
-        """Most central feasible placement (closest to the room centroid), so an
-        arm has room to grow toward each side of a non-convex room."""
-        cx, cy = self.room.polygon.centroid.x, self.room.polygon.centroid.y
+    def _fit_rect(self, room_prep, bounds, centroid, w, h):
+        """Most central axis-aligned placement of a w x h rectangle in this
+        (possibly turned) room, closest to its centroid, so an arm has room to
+        grow toward each side of a non-convex room. Returns (x, y) or None."""
+        minx, miny, maxx, maxy = bounds
+        cx, cy = centroid.x, centroid.y
         sx = max(POS_STEP, (maxx - w - minx) / POS_MAX_STEPS)
         sy = max(POS_STEP, (maxy - h - miny) / POS_MAX_STEPS)
         best, best_d = None, float("inf")
@@ -465,7 +496,7 @@ class Player7(Player):
         while x <= maxx - w + 1e-9:
             y = miny
             while y <= maxy - h + 1e-9:
-                if self._room_prep.contains(box(x, y, x + w, y + h)):
+                if room_prep.contains(box(x, y, x + w, y + h)):
                     d = (x + w / 2 - cx) ** 2 + (y + h / 2 - cy) ** 2
                     if d < best_d:
                         best, best_d = (x, y), d
