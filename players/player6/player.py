@@ -1,7 +1,7 @@
 import math
+import time
 from collections import Counter
 from itertools import combinations_with_replacement, product
-import numpy as np
 
 from shapely import Polygon
 
@@ -16,6 +16,7 @@ class Player6(Player):
 
     GATE = 0
     WALL = 1
+    SEARCH_SECONDS = 45.0
     STEPS = (
         (1, 0),
         (0, 1),
@@ -74,7 +75,7 @@ class Player6(Player):
             )
             heading = math.degrees(math.atan2(y1 - y0, x1 - x0)) + theta
             return self.to_construction(start, heading)
-        
+
         def to_construction(
             self, start: tuple[float, float], start_heading: float
         ) -> Construction:
@@ -348,256 +349,236 @@ class Player6(Player):
         heading = math.degrees(math.atan2(y1 - y0, x1 - x0)) + theta
         return c.to_construction(start, heading)
 
-    def check_face_inventory(self, check):
-        check_new_np = np.array(check)
-        gate_check = check_new_np[np.where(check_new_np[:,0] == Player6.GATE)]
-        gate_uniques, gate_counts = np.unique(gate_check[:,1], return_counts=True)
-        wall_check = check_new_np[np.where(check_new_np[:,0] == Player6.WALL)]
-        wall_uniques, wall_counts = np.unique(wall_check[:,1], return_counts=True)
-        return np.all(self.gates_np[gate_uniques] >= gate_counts) and np.all(self.walls_np[wall_uniques] >= wall_counts)
+    def check_face_inventory(self, pieces):
+        """Check combined demand for walls and gates without changing stock."""
+        needed = Counter(tuple(piece) for piece in pieces)
+        return all(
+            (
+                self.inventory.gates if kind == Player6.GATE else self.inventory.walls
+            ).get(length, 0)
+            >= count
+            for (kind, length), count in needed.items()
+        )
 
-    def enumerate_faces(self, max_length=31):        
-        gate_sizes = self.inventory.gates.keys()
-        wall_sizes = self.inventory.walls.keys()
-        if self.possible_faces:
-            start = max(self.possible_faces.keys()) + 1
-        else:
-            start = min(min(gate_sizes), min(wall_sizes)) # Smallest possible edge length
+    def _out_of_time(self):
+        return time.process_time() >= getattr(self, "_deadline", math.inf)
 
-        # Dynamic Programming to get possible faces
-        for i in range(start, max_length):
+    def _score_upper_bound(self, polygon):
+        """Include the baseline and the largest possible second-gate bonus."""
+        bonus = self.weights.G if sum(self.inventory.gates.values()) >= 2 else 0
+        return (
+            1000
+            + self.weights.A * polygon.area
+            + self.weights.C * polygon.length
+            + bonus
+        )
+
+    def _fit_geometry(self, polygon):
+        """Cache only identical outlines; a failed heuristic fit proves no dominance."""
+        if self._out_of_time() or polygon.area > self.room.polygon.area:
+            return None
+        key = tuple(polygon.exterior.coords)
+        if key not in self._fit_cache:
+            self._fit_cache[key] = find_fit(self.room.polygon, polygon)
+        return self._fit_cache[key]
+
+    def _consider_shape(self, shape, fit):
+        """Save only simulator-validated improvements, using the actual gate faces."""
+        pieces = [piece for edge in shape.edges for piece in edge.pieces]
+        if not any(kind == Player6.GATE for kind, _ in pieces):
+            return None
+        if not self.check_face_inventory(pieces):
+            return None
+        straights = sum(len(edge.pieces) - 1 for edge in shape.edges)
+        if straights > self.inventory.connectors.get(ConnectorType.STRAIGHT, 0):
+            return None
+        construction = shape.to_construction_fit(fit)
+        result = validate_construction(construction, self.room, self.inventory)
+        if not result.valid:
+            return None
+        score = score_construction(result, self.weights)
+        if score > self.best_score:
+            self.best_score = score
+            self.best_shape = shape
+            self.best_fit = fit
+            self.best_construction = construction
+        return score
+
+    def enumerate_faces(self, max_length=31):
+        """Build length-indexed face compositions without permutation duplicates."""
+        gate_sizes = {
+            length
+            for length, count in self.inventory.gates.items()
+            if 5 <= length <= 30 and count > 0
+        }
+        wall_sizes = {
+            length
+            for length, count in self.inventory.walls.items()
+            if 5 <= length <= 30 and count > 0
+        }
+        lengths = gate_sizes | wall_sizes
+        if not lengths:
+            return self.possible_faces
+        start = max(self.possible_faces, default=min(lengths) - 1) + 1
+        straight_count = self.inventory.connectors.get(ConnectorType.STRAIGHT, 0)
+        for length in range(start, min(max_length, 31)):
+            if self._out_of_time():
+                break
             possible = []
-
-            if i in gate_sizes:
-                possible.append([[Player6.GATE, i]])
-            if i in wall_sizes:
-                possible.append([[Player6.WALL, i]])
-
-            for j, constructions in self.possible_faces.items():
-                new_size = i - j
+            if length in gate_sizes:
+                possible.append([(Player6.GATE, length)])
+            if length in wall_sizes:
+                possible.append([(Player6.WALL, length)])
+            for previous_length, constructions in self.possible_faces.items():
+                new_length = length - previous_length
                 for constructed in constructions:
-                    # If we don't have enough straight connectors to add another, then don't bother trying
-                    if len(constructed) >= self.inventory.connectors.get(ConnectorType.STRAIGHT, 30):
+                    # Adding one piece requires len(constructed) straight joints.
+                    if len(constructed) > straight_count:
                         continue
-
-                    if new_size in gate_sizes:
-                        piece = [Player6.GATE, new_size]
-                        # Enforce order so we don't get permutations
-                        if (piece[1], piece[0]) >= (constructed[-1][1], constructed[-1][0]):
-                            check_new = constructed + [piece]
-                            if self.check_face_inventory(check_new):
-                                possible.append(check_new)            
-                    if new_size in wall_sizes:
-                        piece = [Player6.WALL, new_size]
-                        if (piece[1], piece[0]) >= (constructed[-1][1], constructed[-1][0]):
-                            check_new = constructed + [piece]
-                            if self.check_face_inventory(check_new):
-                                possible.append(check_new)
-
+                    for kind, sizes in (
+                        (Player6.GATE, gate_sizes),
+                        (Player6.WALL, wall_sizes),
+                    ):
+                        if new_length not in sizes:
+                            continue
+                        piece = (kind, new_length)
+                        if (new_length, kind) < (
+                            constructed[-1][1],
+                            constructed[-1][0],
+                        ):
+                            continue
+                        candidate = constructed + [piece]
+                        if self.check_face_inventory(candidate):
+                            possible.append(candidate)
             if possible:
-                self.possible_faces[i] = possible
+                self.possible_faces[length] = possible
         return self.possible_faces
 
     def generate_quads(self):
+        """Enumerate rectangles, then lazily assign inventory-backed face pieces."""
         if self.inventory.connectors.get(ConnectorType.RIGHT, 0) < 4:
-            return
-
-        gate_sizes = self.inventory.gates.keys()
-        wall_sizes = self.inventory.walls.keys()
-        smallest_gate = min(gate_sizes) # Since there has to be a gate, the smallest possible rectangle is the smallest gate size
-        smallest_total = min(smallest_gate, min(wall_sizes)) # Smallest possible rectangle size 
-
-        invalid_quads = []
-        valid_quads = []
-        max_i = 31
-        max_j = 31
-        for i in range(smallest_total, 31):
-            if i not in self.possible_faces:
-                continue
-            for j in range(max(i, smallest_gate), 31): 
-                # ixj and jxi are the same since we can rotate
-                # We start at either the smallest gate size or i, based on whichever is higher
-                if (i >= max_i and j >= max_j) or j not in self.possible_faces:
+            return [], []
+        valid_quads, invalid_quads = [], []
+        lengths = sorted(self.possible_faces)
+        for i in lengths:
+            for j in lengths:
+                if self._out_of_time():
+                    return valid_quads, invalid_quads
+                if j < i:
                     continue
-
-                # Check score first to see if possible to be better
-                coords = [(0,0), (i, 0), (i, j), (0, j)]
+                coords = [(0, 0), (i, 0), (i, j), (0, j)]
                 polygon = Polygon(coords)
-                new_score = self.weights.A * polygon.area + self.weights.C * polygon.length
-                new_score_gate = new_score + self.weights.G
-                if new_score_gate < self.best_score:
+                upper = self._score_upper_bound(polygon)
+                if upper <= self.best_score:
                     continue
-                elif new_score < self.best_score and self.best_score < new_score_gate:
-                    need_gates = False # @TODO: This makes it very slow. Maybe we should just search over multiple gates first instead 
-                else:
-                    need_gates = False
-
-                # Then check if it fits
-                fit = find_fit(self.room.polygon, polygon)
-                if not fit:
+                fit = self._fit_geometry(polygon)
+                if fit is None:
                     invalid_quads.append((i, j))
-                    max_i = i
-                    max_j = j
-                    break # We can definitely break out of this loop and return to i loop
-                valid_quads.append((i,j))
-                if i == j:
-                    possible = self.possible_faces[i]
-                    # @TODO: Maybe replace this with iteration so we can break early
-                    combs = combinations_with_replacement(possible, 4)
-                    for comb in combs:
-                        # Check straight connectors
-                        connectors = sum([len(g) - 1 for g in comb])
-                        if connectors > self.inventory.connectors.get(ConnectorType.STRAIGHT, 0):
-                            continue
-
-                        c = [pair for group in comb for pair in group] # Flatten into list of pairs
-                        c = np.array(c)
-
-                        has_gate = np.any(c[:,0] == Player6.GATE)
-
-                        counts = [len(group) for group in comb]
-                        counts = np.repeat(np.arange(1, len(counts) + 1), counts)
-                        gates = counts[c[:,0]]
-                        has_2_gates = np.unique(gates).size > 1
-                        if need_gates and not has_2_gates:
-                            continue
-                        if has_gate and self.check_face_inventory(c):
-                            self.best_score = new_score_gate if has_2_gates else new_score
-                            self.best_fit = fit
-
-                            # Construct shape
-                            self.best_shape = Player6.Shape([Player6.Edge(c, i, len(c) - 1) for c in comb], [90,90,90,90], coords)
-                            break
-                else:
-                    i_poss = self.possible_faces[i]
-                    j_poss = self.possible_faces[j]
-                    # @TODO: Maybe replace this with iteration so we can break early
-                    combs = list(product(
-                        combinations_with_replacement(i_poss, 2),
-                        combinations_with_replacement(j_poss, 2),
-                    ))
-                    for comb in combs:
-                        # Check straight connectors
-                        connectors = sum([len(pair) - 1 for g in comb for pair in g])
-                        if connectors > self.inventory.connectors.get(ConnectorType.STRAIGHT, 0):
-                            continue
-
-                        c = [pair for result in comb for group in result for pair in group] # Flatten into list of pairs
-
-                        c = np.array(c)
-                        has_gate = np.any(c[:,0] == Player6.GATE)
-
-                        counts = [len(pair) for group in comb for pair in group]
-                        counts = np.repeat(np.arange(1, len(counts) + 1), counts)
-                        gates = counts[c[:,0]]
-                        has_2_gates = np.unique(gates).size > 1
-                        if need_gates and not has_2_gates:
-                            continue
-                        if has_gate and self.check_face_inventory(c):
-                            self.best_score = new_score_gate if has_2_gates else new_score
-                            self.best_fit = fit
-
-                            pair1 = comb[0]
-                            pair2 = comb[1]
-                            edges = [Player6.Edge(pair1[0], i, len(pair1[0]) - 1),
-                                      Player6.Edge(pair2[0], j, len(pair2[0]) - 1),
-                                        Player6.Edge(pair1[1], i, len(pair1[1]) - 1),
-                                          Player6.Edge(pair2[1], j, len(pair2[1]) - 1)]
-                            self.best_shape = Player6.Shape(edges, [90,90,90,90], coords)
-                            break
-        return valid_quads, invalid_quads
-        
-    def generate_quad_shapes(self):
-        # Try L Shapes
-        if self.inventory.connectors.get(ConnectorType.RIGHT, 0) >= 6:
-            gate_sizes = self.inventory.gates.keys()
-            wall_sizes = self.inventory.walls.keys()
-            smallest_gate = min(gate_sizes) # Since there has to be a gate, the smallest possible rectangle is the smallest gate size
-            smallest_total = min(smallest_gate, min(wall_sizes)) # Smallest possible rectangle size 
-            smallest_total = smallest_total * 2 # Since we need to split along both i and j
-
-            no_fit = []
-            for i in range(smallest_total, 31):
-                if i not in self.possible_faces:
+                    # A timeout or limited-angle failure is not proof that
+                    # larger rectangles cannot fit. Do not prune other sizes.
                     continue
+                valid_quads.append((i, j))
 
-                for j in range(max(i, smallest_total), 31): 
-                    # ixj and jxi are the same since we can rotate
-                    # We start at either the smallest gate size or i, based on whichever is higher
-                    if j not in self.possible_faces:
-                        continue
+                if i == j:
+                    combinations = combinations_with_replacement(
+                        self.possible_faces[i], 4
+                    )
+                else:
+                    # Keep the Cartesian product lazy: materializing all pairs
+                    # can consume substantial memory before finding a match.
+                    combinations = (
+                        (first[0], second[0], first[1], second[1])
+                        for first in combinations_with_replacement(
+                            self.possible_faces[i], 2
+                        )
+                        for second in combinations_with_replacement(
+                            self.possible_faces[j], 2
+                        )
+                    )
+                for compositions in combinations:
+                    if self._out_of_time():
+                        return valid_quads, invalid_quads
+                    edges = [
+                        Player6.Edge(list(pieces), length, len(pieces) - 1)
+                        for pieces, length in zip(compositions, (i, j, i, j))
+                    ]
+                    shape = Player6.Shape(edges, [90] * 4, coords)
+                    score = self._consider_shape(shape, fit)
+                    if score is not None and score >= upper:
+                        break
+        return valid_quads, invalid_quads
 
-                    i_poss = self.possible_faces[i]
-                    j_poss = self.possible_faces[j]
-
-                    # We need both to have multiple segments
-                    i_poss = [poss for poss in i_poss if len(poss) > 1]
-                    j_poss = [poss for poss in j_poss if len(poss) > 1]
-
-                    checked = {}
-
-                    for i_sel in i_poss:
-                        for j_sel in j_poss:
-                            # Just choose first split. @TODO: We may need to investigate other splits
-                            split_i = i_sel[0][1]
-                            split_j = j_sel[0][1]
-                            # There are repeated split lengths, so we keep track to make sure we don't retry to fit them
-                            if (split_i, split_j) in checked:
-                                continue
-                            # If the generated shape would enclose a previously checked L-shape that couldn't fit, then skip
-                            fast_fit_check = np.array(no_fit)
-                            if len(no_fit) > 0 and ((fast_fit_check[:, 0] >= split_i) & (fast_fit_check[:, 1] <= split_j)).any():
-                                continue
-                            checked[(split_i, split_j)] = True
-
-                            # Check score first to see if possible to be better
-                            coords = [(0,0), (split_i, 0), (split_i, split_j), (i, split_j), (i, j), (0, j)]
-                            polygon = Polygon(coords)
-                            new_score = self.weights.A * polygon.area + self.weights.C * polygon.length
-                            new_score_gate = new_score + self.weights.G
-                            if new_score_gate < self.best_score:
-                                continue
-                            elif new_score < self.best_score and self.best_score < new_score_gate:
-                                need_gates = False # @TODO: This makes it very slow. Maybe we should just search over multiple gates first instead 
-                            else:
-                                need_gates = False
-
-                            # Then check if it fits
-                            fit = find_fit(self.room.polygon, polygon)
-                            if not fit:
-                                no_fit.append([split_i, split_j])
-                                continue
-
-                            found = False
-                            for i_second in i_poss:
-                                if found:
-                                    break
-                                for j_second in j_poss:
-                                    if found:
-                                        break
-                                    comb = [i_sel, j_sel, i_second, j_second]
-                                    c = np.array(i_sel + j_sel + i_second + j_second)
-                                    has_gate = np.any(c[:,0] == Player6.GATE)
-
-                                    counts = [len(group) for group in comb]
-                                    counts = np.repeat(np.arange(1, len(counts) + 1), counts)
-                                    gates = counts[c[:,0]]
-                                    has_2_gates = np.unique(gates).size > 1
-                                    if need_gates and not has_2_gates:
-                                        continue
-                                    if has_gate and self.check_face_inventory(c):
-                                        self.best_score = new_score_gate if has_2_gates else new_score
-                                        self.best_fit = fit
-
-                                        # Construct shape
-                                        edges = [Player6.Edge([i_sel[0]], split_i, 0),
-                                                Player6.Edge([j_sel[0]], split_j, 0),
-                                                Player6.Edge(i_sel[1:], i - split_i, len(i_sel[1:]) - 1),
-                                                Player6.Edge(j_sel[1:], j - split_j, len(j_sel[1:]) - 1),
-                                                    Player6.Edge(i_second, i, len(i_second) - 1),
-                                                    Player6.Edge(j_second, j, len(j_second) - 1)]
-                                        self.best_shape = Player6.Shape(edges, [90,-90,90,90,90,90], coords)
-                                        found = True
+    def generate_quad_shapes(self):
+        """Search L outlines; fit caching never skips alternative material assignments."""
+        if self.inventory.connectors.get(ConnectorType.RIGHT, 0) < 6:
+            return
+        lengths = sorted(self.possible_faces)
+        for i in lengths:
+            i_groups = {}
+            for pieces in self.possible_faces[i]:
+                if len(pieces) > 1:
+                    i_groups.setdefault(pieces[0][1], []).append(pieces)
+            for j in lengths:
+                if self._out_of_time():
+                    return
+                if j < i:
+                    continue
+                j_groups = {}
+                for pieces in self.possible_faces[j]:
+                    if len(pieces) > 1:
+                        j_groups.setdefault(pieces[0][1], []).append(pieces)
+                for split_i, i_options in i_groups.items():
+                    for split_j, j_options in j_groups.items():
+                        if self._out_of_time():
+                            return
+                        coords = [
+                            (0, 0),
+                            (split_i, 0),
+                            (split_i, split_j),
+                            (i, split_j),
+                            (i, j),
+                            (0, j),
+                        ]
+                        polygon = Polygon(coords)
+                        upper = self._score_upper_bound(polygon)
+                        if upper <= self.best_score:
+                            continue
+                        # Cache by the complete outline, including outer dimensions.
+                        # A failed larger L must not reject a smaller L.
+                        fit = self._fit_geometry(polygon)
+                        if fit is None:
+                            continue
+                        combinations = product(
+                            i_options,
+                            j_options,
+                            self.possible_faces[i],
+                            self.possible_faces[j],
+                        )
+                        for i_sel, j_sel, i_second, j_second in combinations:
+                            if self._out_of_time():
+                                return
+                            face_pieces = [
+                                [i_sel[0]],
+                                [j_sel[0]],
+                                i_sel[1:],
+                                j_sel[1:],
+                                i_second,
+                                j_second,
+                            ]
+                            edges = [
+                                Player6.Edge(
+                                    list(pieces),
+                                    sum(p[1] for p in pieces),
+                                    len(pieces) - 1,
+                                )
+                                for pieces in face_pieces
+                            ]
+                            shape = Player6.Shape(
+                                edges, [90, -90, 90, 90, 90, 90], coords
+                            )
+                            score = self._consider_shape(shape, fit)
+                            if score is not None and score >= upper:
+                                break
 
     def find_candidates(self, max_shapes=10) -> list[Shape]:
         """Build the material inventory, enumerate straight-face options, and
@@ -663,21 +644,21 @@ class Player6(Player):
         #
         # PLACEMENT_GUIDE.md covers placing a shape in the room; SIMULATOR_GUIDE.md
         # covers everything else; players/example_player.py is a worked example.
-        
-        # Sanitize inputs
-        self.inventory.gates = {k: v for k, v in self.inventory.gates.items() if 5 <= k <= 30 and v > 0}
-        self.inventory.walls = {k: v for k, v in self.inventory.walls.items() if 5 <= k <= 30 and v > 0}
 
-        self.gates_np = np.array([self.inventory.gates.get(i, 0) for i in range(0, 31)])
-        self.walls_np = np.array([self.inventory.walls.get(i, 0) for i in range(0, 31)])
-
+        # Keep the supplied inventory unchanged, and return the best validated
+        # construction before the submission checker's 60-second CPU limit.
+        self._deadline = time.process_time() + self.SEARCH_SECONDS
+        self._fit_cache = {}
         self.best_shape = None
         self.best_fit = None
         self.best_score = 0
+        self.best_construction = None
 
         self.possible_faces = {}
+        if not self.inventory.has_gate():
+            return None
         self.enumerate_faces()
         self.generate_quads()
         self.generate_quad_shapes()
 
-        return self.best_shape.to_construction_fit(self.best_fit) if self.best_shape else None
+        return self.best_construction
