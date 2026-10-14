@@ -1,13 +1,16 @@
 import heapq
+import math
 import time
 
 import src.constants as c
 from players.player0 import Player
 from players.player10.assign import Assigner, Assignment
+from players.player10.freeform import Faces, Grower, Loop
 from players.player10.placement import RoomSearch
 from players.player10.shapes import (
     CORNERS_NEEDED,
     HEADING_STEP_DEG,
+    HEXAGON,
     L_SHAPE,
     MEASURES,
     OCTAGON,
@@ -16,6 +19,8 @@ from players.player10.shapes import (
     U_SHAPE,
     Shape,
     contains_smaller,
+    free_shape,
+    headed_faces,
     inner_radius,
     inner_rectangles,
     make_shape,
@@ -25,11 +30,18 @@ from src.pieces import Connector, ConnectorType, Piece, PieceType
 
 # CPU seconds the search may use. Nothing can interrupt a player on Windows, so
 # the player has to stop itself well inside the simulator's limit.
-TIME_BUDGET = 20.0
-# how far into the budget each stage of the search may run
-RECTANGLE_SHARE = 0.3
-L_SHARE = 0.5
-OCTAGON_SHARE = 0.8
+TIME_BUDGET = 42.0
+# how far into the budget each stage of the search may run; growing gets the rest
+RECTANGLE_SHARE = 0.12
+L_SHARE = 0.25
+OCTAGON_SHARE = 0.42
+U_SHARE = 0.55
+# growing asks for pieces for thousands of loops, so each ask gets less effort
+GROW_ASSIGN_NODES = 3000
+MAX_SEEDS = 6
+# the best rectangle is also grown from other places it fits, this many at most
+EXTRA_SPOTS = 2
+SPOTS_TRIED = 24
 FALLBACK_BUDGET = 3.0
 FALLBACK_SHAPES = 40
 RECENT_FAILURES = 400
@@ -39,8 +51,9 @@ Candidate = tuple[float, str, tuple[int, ...]]
 
 
 class Player10(Player):
-    """Group 10: the best-scoring rectangle, octagon, L-shape or U-shape the inventory can
-    build (sides may be several pieces), placed against the room's own walls."""
+    """Group 10: the best-scoring rectangle, L, U, hexagon or octagon the inventory
+    can build, placed against the room's own walls, then grown face by face into
+    a free-form loop that fills the room."""
 
     def build_enclosure(self) -> Construction | None:
         self._best: Construction | None = None
@@ -61,11 +74,15 @@ class Player10(Player):
         self._search_room = RoomSearch(self.room)
         self._failures: dict[str, list[tuple[int, ...]]] = {}
         self._fitting_rectangles: list[tuple[int, int]] = []
+        self._seeds: list[Loop] = []
+        self._rectangle: tuple | None = None
         bonus = weights.G if len(self._assigner.targets) == 2 else 0.0
+        self._bonus = bonus
+        stock = self.inventory.connectors
         families = [
             family
-            for family, (kind, needed) in CORNERS_NEEDED.items()
-            if self.inventory.connectors.get(kind, 0) >= needed
+            for family, needs in CORNERS_NEEDED.items()
+            if all(stock.get(kind, 0) >= n for kind, n in needs.items())
         ]
 
         # cheapest families first, so there is always something to fall back on
@@ -74,16 +91,90 @@ class Player10(Player):
         stages = [
             ([RECTANGLE], RECTANGLE_SHARE),
             ([L_SHAPE], L_SHARE),
-            ([OCTAGON], OCTAGON_SHARE),
-            ([U_SHAPE], 1.0),
+            ([OCTAGON, HEXAGON], OCTAGON_SHARE),
+            ([U_SHAPE], U_SHARE),
         ]
         for stage, share in stages:
             wanted = [f for f in stage if f in families]
             if wanted:
                 self._deadline = started + TIME_BUDGET * share
                 self._search([x for f in wanted for x in self._candidates(f, bonus)])
+        self._grow(started + TIME_BUDGET)
         if self._best is None and not self.note:
             self.note = "nothing the inventory can build fits and scores above 0"
+
+    # ------------------------------------------------------------------ grow
+
+    def _grow(self, deadline: float) -> None:
+        """Grow the shapes found so far into free-form loops (see freeform.py)."""
+        if not self._seeds:
+            return
+        stock = self.inventory.connectors
+        grower = Grower(
+            region=self._search_room.region,
+            room_corners=self._search_room.corners,
+            buildable=set(self._assigner.lengths),
+            rights=stock.get(ConnectorType.RIGHT, 0),
+            diagonals=stock.get(ConnectorType.DIAGONAL, 0),
+            total_length=self._assigner.total_length,
+            score=lambda area, perimeter: self._score(area, perimeter) + self._bonus,
+            accept=self._accept_loop,
+            can_build=lambda lengths: self._assigner.assign(lengths) is not None,
+        )
+        self._assigner.max_nodes = GROW_ASSIGN_NODES
+        seeds = sorted(self._seeds, key=lambda loop: -loop.score)[:MAX_SEEDS]
+        seeds += self._other_spots()
+        # the charge for a side over the limit starts below what a unit of
+        # growth earns, so spreading out comes first and repairs second
+        grower.grow(seeds, deadline, first_charge=max(self.weights.A, 0.1))
+
+    def _other_spots(self) -> list[Loop]:
+        """The best rectangle again, at other places it fits: a room with
+        several open areas gets a seed growing in each."""
+        if self._rectangle is None:
+            return []
+        shape, first, score = self._rectangle
+        a, b = shape.params
+
+        def centre(start, heading):
+            t = math.radians(heading)
+            return (
+                start[0] + (a * math.cos(t) - b * math.sin(t)) / 2.0,
+                start[1] + (a * math.sin(t) + b * math.cos(t)) / 2.0,
+            )
+
+        taken = [centre(*first)]
+        spots = []
+        for start, heading in self._placements(shape, limit=SPOTS_TRIED):
+            here = centre(start, heading)
+            if all(math.dist(here, other) >= max(a, b) for other in taken):
+                taken.append(here)
+                spots.append(Loop(start, heading, headed_faces(shape), score))
+                if len(spots) >= EXTRA_SPOTS:
+                    break
+        return spots
+
+    def _accept_loop(
+        self, start: tuple[float, float], heading: float, faces: Faces
+    ) -> float | None:
+        """The true score of a loop, if the inventory can build it and the
+        simulator accepts it; the best one seen is kept."""
+        shape = free_shape(faces)
+        assignment = self._assigner.assign(shape.faces)
+        if assignment is None:
+            return None
+        # a loop's faces are headed from the loop's own heading, and its first
+        # face need not point along it
+        first = heading + 45.0 * faces[0][0]
+        construction = self._construction(shape, assignment, start, first)
+        result = validate_construction(construction, self.room, self.inventory)
+        if not result.valid:
+            return None
+        score = score_construction(result, self.weights)
+        if score > self._best_score:
+            self._best, self._best_score = construction, score
+            self.note = f"{shape.describe()}, score {score:.1f}"
+        return score
 
     # ------------------------------------------------------------ candidates
 
@@ -105,6 +196,8 @@ class Player10(Player):
                 for t in lengths
                 if t <= p
             ]
+        elif family == HEXAGON:
+            params = [(a, d1, d2) for a in lengths for d1 in lengths for d2 in lengths]
         elif family == U_SHAPE:
             params = [
                 (left, gap, right, height, leg)
@@ -225,6 +318,9 @@ class Player10(Player):
             if not result.valid:
                 continue
             score = score_construction(result, self.weights)
+            self._seeds.append(Loop(start, heading, headed_faces(shape), score))
+            if shape.family == RECTANGLE:
+                self._rectangle = (shape, (start, heading), score)
             if score > self._best_score:
                 self._best, self._best_score = construction, score
                 self.note = f"{shape.describe()}, score {score:.1f}"

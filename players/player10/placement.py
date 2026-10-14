@@ -82,12 +82,18 @@ class RoomSearch:
         if step not in self._bases:
             weight: dict[float, float] = {}
             exact: dict[float, float] = {}
+            longest: dict[float, float] = {}
             points = np.vstack([self.corners, self.corners[:1]])
             for (x1, y1), (x2, y2) in itertools.pairwise(points):
                 angle = math.degrees(math.atan2(y2 - y1, x2 - x1)) % step
-                key = round(angle, 6) % step
-                weight[key] = weight.get(key, 0.0) + math.hypot(x2 - x1, y2 - y1)
-                exact[key] = 0.0 if key == 0 else angle
+                # walls within a hundredth of a degree are one direction: rooms
+                # given to three decimals have walls at 22.5 and 22.501
+                key = round(angle, 2) % step
+                length = math.hypot(x2 - x1, y2 - y1)
+                weight[key] = weight.get(key, 0.0) + length
+                if length > longest.get(key, 0.0):
+                    longest[key] = length
+                    exact[key] = 0.0 if key == 0 else angle
             best = sorted(weight, key=lambda k: -weight[k])[:MAX_BASE_HEADINGS]
             headings = [exact[k] for k in best]
             if 0.0 not in headings:

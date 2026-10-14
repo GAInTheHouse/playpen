@@ -52,6 +52,7 @@ class Assigner:
                 )
         self.lengths = sorted(self.compositions)
         self._cache: dict[tuple[int, ...], tuple | None] = {}
+        self.max_nodes = MAX_SEARCH_NODES
 
     def _compose(self, keys, index, remaining, chosen, found):
         if remaining == 0:
@@ -112,7 +113,7 @@ class Assigner:
         if state in self._failed:
             return False
         self._nodes += 1
-        if self._nodes > MAX_SEARCH_NODES:
+        if self._nodes > self.max_nodes:
             return False
         plain, gated = self.compositions[ordered[i]]
         options = gated + plain if gate_faces < target else plain + gated
