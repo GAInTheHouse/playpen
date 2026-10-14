@@ -10,7 +10,12 @@ from players.player0 import Player
 from shapely.geometry import Polygon
 from shapely.prepared import prep
 from src.constants import BASELINE_SCORE, MAX_FACE_LENGTH, TOL
-from src.enclosure import Construction, score_construction, validate_construction
+from src.enclosure import (
+    Construction,
+    compute_faces,
+    score_construction,
+    validate_construction,
+)
 from src.pieces import Connector, ConnectorType, Piece, PieceType
 
 
@@ -24,6 +29,9 @@ class Player2(Player):
     ALLOCATION_CPU_SECONDS = 0.04
     PLACEMENT_CPU_SECONDS = 0.03
     MAX_CANDIDATES_PER_FAMILY = 500
+    MUTATION_BEAM_WIDTH = 6
+    MUTATION_ROUNDS = 3
+    MAX_MUTATION_FACES = 20
 
     def build_enclosure(self) -> Construction | None:
         started = time.process_time()
@@ -358,6 +366,9 @@ class Player2(Player):
         best_family = ""
         tried = 0
         best_sides = None
+        mutation_seeds = []
+        mutation_tried = 0
+        mutation_valid = 0
         refinement_tried = 0
 
         def evaluate(base, family, sides, hint=None):
@@ -415,6 +426,9 @@ class Player2(Player):
             result = validate_construction(construction, self.room, self.inventory)
             if result.valid:
                 score = score_construction(result, self.weights)
+                mutation_seeds.append((score, construction))
+                mutation_seeds.sort(key=lambda item: item[0], reverse=True)
+                del mutation_seeds[self.MUTATION_BEAM_WIDTH :]
                 if score > best_score:
                     best, best_score = construction, score
                     best_family = family
@@ -438,7 +452,10 @@ class Player2(Player):
             evaluate(base, family, sides)
 
         local_seen = set()
-        while best is not None and not expired():
+        mutation_start = started + budget * 0.65
+        while (
+            best is not None and not expired() and time.process_time() < mutation_start
+        ):
             family, seed = best_family, best_sides
             parameters = self._parameters(family, seed)
             neighbors = []
@@ -476,8 +493,140 @@ class Player2(Player):
             if not improved:
                 break
 
+        # Mutate complete valid loops. Lower-scoring valid notches remain in
+        # a small beam, allowing a later bulge to improve the enclosure.
+        if best is not None:
+            mutation_seeds.append((best_score, best))
+        beam = []
+        mutation_seen = set()
+        for score, construction in sorted(
+            mutation_seeds, key=lambda item: item[0], reverse=True
+        ):
+            face_list = compute_faces(construction)
+            sides = tuple(int(face.length) for face in face_list)
+            turns = tuple(
+                int(construction.connectors[face.piece_indices[0]].turn_angle())
+                for face in face_list
+            )
+            key = (sides, turns, construction.start, construction.start_heading)
+            if key not in mutation_seen:
+                mutation_seen.add(key)
+                beam.append(
+                    (
+                        score,
+                        sides,
+                        turns,
+                        construction.start,
+                        construction.start_heading,
+                    )
+                )
+            if len(beam) == self.MUTATION_BEAM_WIDTH:
+                break
+
+        for round_index in range(self.MUTATION_ROUNDS):
+            if expired() or not beam:
+                break
+            next_beam = list(beam)
+            round_deadline = time.process_time() + max(
+                0, deadline - time.process_time()
+            ) / (self.MUTATION_ROUNDS - round_index)
+            # Round-robin over parents prevents one seed consuming the budget.
+            streams = [
+                iter(self._face_mutations(sides, turns, set(faces)))
+                for _, sides, turns, _, _ in beam
+            ]
+            active = set(range(len(streams)))
+            while active and not expired() and time.process_time() < round_deadline:
+                for index in sorted(active):
+                    if expired() or time.process_time() >= round_deadline:
+                        break
+                    try:
+                        sides, turns, kind = next(streams[index])
+                    except StopIteration:
+                        active.remove(index)
+                        continue
+                    _, _, _, start, heading = beam[index]
+                    key = (sides, turns, start, heading)
+                    if key in mutation_seen or len(sides) > self.MAX_MUTATION_FACES:
+                        continue
+                    mutation_seen.add(key)
+                    if (
+                        sum(abs(t) == 90 for t in turns) > right
+                        or sum(abs(t) == 45 for t in turns) > diagonal
+                    ):
+                        continue
+                    mutation_tried += 1
+                    vertices = self._integer_vertices(sides, turns)
+                    if vertices is None:
+                        continue
+                    local = Polygon(vertices)
+                    if not local.is_valid or local.area <= 0:
+                        continue
+                    theta = math.radians(heading)
+                    co, si = math.cos(theta), math.sin(theta)
+                    polygon = Polygon(
+                        [
+                            (start[0] + x * co - y * si, start[1] + x * si + y * co)
+                            for x, y in vertices
+                        ]
+                    )
+                    # Endpoint-preserving mutations first keep the parent's
+                    # placement, rather than moving the original boundary.
+                    if not buffered_room.contains(polygon):
+                        continue
+                    assemblies = allocate(sides, 2) if self.weights.G > 0 else None
+                    if assemblies is None:
+                        assemblies = allocate(sides, 1)
+                    if assemblies is None:
+                        continue
+                    pieces, connectors = [], []
+                    for usage, turn in zip(assemblies, turns):
+                        face = [
+                            piece for piece, n in zip(types, usage) for _ in range(n)
+                        ]
+                        pieces.extend(face)
+                        connectors.append(
+                            Connector(
+                                ConnectorType.RIGHT
+                                if abs(turn) == 90
+                                else ConnectorType.DIAGONAL,
+                                reflex=turn < 0,
+                            )
+                        )
+                        connectors.extend(
+                            Connector(ConnectorType.STRAIGHT) for _ in face[1:]
+                        )
+                    construction = Construction(start, heading, pieces, connectors)
+                    result = validate_construction(
+                        construction, self.room, self.inventory
+                    )
+                    if not result.valid:
+                        continue
+                    mutation_valid += 1
+                    score = score_construction(result, self.weights)
+                    next_beam.append((score, sides, turns, start, heading))
+                    # Keep one slot for an inward notch, even if it temporarily
+                    # loses area. Other slots retain the strongest scores.
+                    next_beam.sort(key=lambda item: item[0], reverse=True)
+                    if kind == "notch":
+                        next_beam = next_beam[: self.MUTATION_BEAM_WIDTH - 1] + [
+                            (score, sides, turns, start, heading)
+                        ]
+                    else:
+                        next_beam = next_beam[: self.MUTATION_BEAM_WIDTH]
+                    if score > best_score:
+                        best, best_score, best_family = (
+                            construction,
+                            score,
+                            "mutated polygon",
+                        )
+                        print(
+                            f"Playpen: improved mutation, score {score:.2f}", flush=True
+                        )
+            beam = next_beam
+
         timed_out = expired()
-        progress = f"tried {tried} of {len(candidates)} candidates, {refinement_tried} local refinements"
+        progress = f"tried {tried} of {len(candidates)} candidates, {refinement_tried} local refinements, {mutation_tried} mutations ({mutation_valid} valid)"
         if best:
             self.note = f"Composite {best_family}; score {best_score:.2f} ({progress})."
         elif not candidates:
@@ -573,3 +722,39 @@ class Player2(Player):
                     change = [0] * count
                     change[first], change[second] = a, b
                     yield tuple(change)
+
+    @staticmethod
+    def _face_mutations(sides, turns, available_lengths):
+        """Replace L by a,d,b,d,c with a+b+c=L, preserving its endpoint.
+
+        The four added turns sum to zero. A negative first turn is an
+        outward bulge for a CCW loop; a positive first turn is an inward notch.
+        Diagonal parent faces work too: the detour rotates with the face.
+        """
+        lengths = sorted(available_lengths)
+        # Exhaust feasible integer depths, prioritizing small useful detours.
+        for index, length in enumerate(sides):
+            for a in lengths:
+                for c in lengths:
+                    b = length - a - c
+                    if b not in available_lengths:
+                        continue
+                    for depth in lengths:
+                        for direction, kind in ((-90, "bulge"), (90, "notch")):
+                            new_sides = (
+                                sides[:index]
+                                + (a, depth, b, depth, c)
+                                + sides[index + 1 :]
+                            )
+                            new_turns = (
+                                turns[:index]
+                                + (
+                                    turns[index],
+                                    direction,
+                                    -direction,
+                                    -direction,
+                                    direction,
+                                )
+                                + turns[index + 1 :]
+                            )
+                            yield new_sides, new_turns, kind

@@ -15,7 +15,7 @@ from src.pieces import Connector, ConnectorType
 SEARCH_SECONDS = 40.0
 # a narrow pass over every anchor first, so a good answer exists early, then
 # wider passes with whatever time is left
-BEAM_WIDTHS = (40, 200)
+BEAM_WIDTHS = (40, 500)
 MAX_FACES = 14
 EDGE_FRACTIONS = (0.25, 0.5)
 
