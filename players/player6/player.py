@@ -516,6 +516,7 @@ class Player6(Player):
             smallest_total = min(smallest_gate, min(wall_sizes)) # Smallest possible rectangle size 
             smallest_total = smallest_total * 2 # Since we need to split along both i and j
 
+            no_fit = []
             for i in range(smallest_total, 31):
                 if i not in self.possible_faces:
                     continue
@@ -534,7 +535,6 @@ class Player6(Player):
                     j_poss = [poss for poss in j_poss if len(poss) > 1]
 
                     checked = {}
-                    no_fit = []
 
                     for i_sel in i_poss:
                         for j_sel in j_poss:
