@@ -3,7 +3,7 @@ import time
 from collections import Counter
 
 from shapely import affinity
-from shapely.geometry import Point, Polygon, box
+from shapely.geometry import LineString, Point, Polygon, box
 from shapely.ops import polylabel
 from shapely.prepared import prep
 
@@ -33,8 +33,12 @@ OCT_ANCHORS = 12  # deepest centers tried per octagon
 POS_STEP = 1.0  # smallest grid step (units) when scanning rectangle positions
 POS_MAX_STEPS = 32  # cap positions per axis so big rooms stay fast
 MAX_ARMS = 30  # beam levels: each level adds one tab (one concave corner)
-BEAM_WIDTH = 4  # shapes kept per level (and per kind of starting shape)
-BEAM_EVAL = 24  # children fully validated per level before moving on
+BEAM_WIDTH = 6  # shapes kept per level (and per kind of starting shape)
+BEAM_EVAL = 36  # children fully validated per level before moving on
+OPEN_BONUS = 0.5  # weight on the room left ahead of a bump (see _tab_moves)
+OPEN_RAY_STEP = 2.5  # degrees between rays when looking for open directions
+OPEN_DIRECTIONS = 3  # most open directions to tilt starting shapes toward
+OPEN_SEPARATION = 15.0  # degrees two open directions must differ by
 ALLOC_NODES = 2000  # backtracking budget when assigning pieces to faces
 
 
@@ -138,6 +142,20 @@ def _octagon_verts(a, b, cc, d):
         x, y = x + f * math.cos(t), y + f * math.sin(t)
     cx, cy = _centroid(pts)
     return [(px - cx, py - cy) for px, py in pts]
+
+
+def _merge_headings(headings, directions, period):
+    """`headings` plus each direction taken modulo `period` (the turn after
+    which the shape looks the same), skipping any within a degree of one
+    already listed. A shape turned by d mod period has a side facing d."""
+    out = list(headings)
+    for d in directions:
+        h = d % period
+        if h > period - 1.0:
+            h = 0.0
+        if all(abs(h - o) > 1.0 for o in [*out, 0.0]):
+            out.append(h)
+    return out
 
 
 def _canon(verts):
@@ -349,9 +367,10 @@ class Player7(Player):
         """Beam search over buildable shapes, run twice and the better result
         kept. The first run starts from straight rectangles and octilinear
         octagons (any face may be missing, so hexagons and tilted rectangles
-        too, at several tilts). The second starts from tilted rectangles and
-        uses whatever time is left; keeping it separate means tilting can only
-        add to what the first run finds, never crowd its shapes out."""
+        too, at several tilts). The second starts from tilted rectangles, plus
+        rectangles and octagons turned so a side faces one of the room's most
+        open directions, and uses whatever time is left; keeping it separate
+        means those starts add to the first run instead of crowding it."""
         if not self.inventory.has_gate():
             return None
         coins = [
@@ -376,6 +395,8 @@ class Player7(Player):
         self._faceable = set(self._buildables) | set(self._gate_lengths)
         self._room_prep = prep(self.room.polygon)
         self._decomp_cache = {}
+        minx, miny, maxx, maxy = self.room.polygon.bounds
+        self._diameter = math.hypot(maxx - minx, maxy - miny) + 1.0
 
         deadline = time.process_time() + SEARCH_CPU_BUDGET
         rectangles = self.inventory.connectors.get(ConnectorType.RIGHT, 0) >= 4
@@ -384,19 +405,88 @@ class Player7(Player):
             starts += self._best_rectangles(deadline, BEAM_WIDTH, [0.0])
         starts += self._octilinear_bases(deadline, BEAM_WIDTH)
         best = self._beam(starts, deadline)
+        # second run: tilted starts, including tilts that face a side toward the
+        # room's most open directions
+        open_dirs = self._open_directions()
+        tilted = []
         if rectangles:
-            tilted = self._best_rectangles(deadline, BEAM_WIDTH, RECT_HEADINGS[1:])
-            other = self._beam(tilted, deadline)
-            if best is None or (other is not None and other[0] > best[0]):
-                best = other
+            headings = _merge_headings(RECT_HEADINGS[1:], open_dirs, 90)
+            tilted += self._best_rectangles(deadline, BEAM_WIDTH, headings)
+        extra = [h for h in _merge_headings([], open_dirs, 45) if h > 0]
+        extra = [h for h in extra if all(abs(h - o) > 1.0 for o in OCT_HEADINGS)]
+        if extra:
+            tilted += self._octilinear_bases(deadline, BEAM_WIDTH, extra)
+        other = self._beam(tilted, deadline)
+        if best is None or (other is not None and other[0] > best[0]):
+            best = other
         return best[2] if best else None
+
+    def _open_directions(self):
+        """The room's OPEN_DIRECTIONS most open directions (degrees): from its
+        deepest point, every OPEN_RAY_STEP degrees, how far a strip as wide as
+        the shortest buildable face can run (a bare ray would aim at far
+        corners instead of down hallways). Keeps the longest local peaks at
+        least OPEN_SEPARATION degrees apart."""
+        room = self.room.polygon
+        pole = polylabel(room, tolerance=0.25)
+        width = self._buildables[0]
+        n = round(360 / OPEN_RAY_STEP)
+        runs = []
+        for i in range(n):
+            t = math.radians(i * OPEN_RAY_STEP)
+            runs.append(
+                self._strip_ahead(pole.x, pole.y, math.cos(t), math.sin(t), width)
+            )
+        peaks = sorted(
+            (
+                (runs[i], i * OPEN_RAY_STEP)
+                for i in range(n)
+                if runs[i] > 0
+                and runs[i] >= runs[i - 1]
+                and runs[i] >= runs[(i + 1) % n]
+            ),
+            reverse=True,
+        )
+        kept = []
+        for _run, angle in peaks:
+            gaps = (min(abs(angle - k), 360 - abs(angle - k)) for k in kept)
+            if all(g >= OPEN_SEPARATION for g in gaps):
+                kept.append(angle)
+            if len(kept) == OPEN_DIRECTIONS:
+                break
+        return kept
+
+    def _strip_ahead(self, x, y, dx, dy, width):
+        """How far a strip of this width, centered on (x, y), can run along the
+        unit direction (dx, dy) before touching a wall: the shortest of three
+        parallel rays (middle and just inside both edges)."""
+        half = 0.45 * width
+        px, py = -dy, dx
+        return min(
+            self._room_ahead(x + px * o, y + py * o, dx, dy) for o in (-half, 0, half)
+        )
+
+    def _room_ahead(self, x, y, dx, dy):
+        """How far from (x, y) along the unit direction (dx, dy) we can go
+        before leaving the room (0 if (x, y) isn't inside it)."""
+        reach = self._diameter
+        ray = LineString([(x, y), (x + dx * reach, y + dy * reach)])
+        start = Point(x, y)
+        inside = self.room.polygon.intersection(ray)
+        for part in getattr(inside, "geoms", [inside]):
+            if part.geom_type == "LineString" and part.distance(start) < 1e-6:
+                return part.length
+        return 0.0
 
     def _beam(self, starts, deadline):
         """Level 0 is `starts`. Each level adds one tab (one more concave
-        corner) to every shape in the beam and keeps the best BEAM_WIDTH
-        results, even when they score below their parent, so the search can
-        pass through a worse intermediate shape. Returns the best (score,
-        vertices, construction) seen at any level, or None."""
+        corner) to every shape in the beam. Children are checked best-first by
+        estimated score plus an open-room bonus (see `_tab_moves`); of the valid
+        ones, the BEAM_WIDTH best by true score plus bonus survive, even when
+        they score below their parent, so the search can pass through a worse
+        intermediate shape and favours bumps with room to keep growing. Returns
+        the best (score, vertices, construction) by true score seen anywhere,
+        or None."""
         beam = [(score, _clean(verts), cons) for verts, cons, score in starts]
         best = max(beam, key=lambda s: s[0], default=None)
         for _level in range(MAX_ARMS):
@@ -404,15 +494,15 @@ class Player7(Player):
                 break
             children = {}
             for _score, verts, _construction in beam:
-                for est, new in self._tab_moves(verts, deadline):
+                for est, bonus, new in self._tab_moves(verts, deadline):
                     key = _canon(new)
-                    if key not in children or est > children[key][0]:
-                        children[key] = (est, new)
-            next_beam, tried = [], 0
-            for _est, new in sorted(
-                children.values(), key=lambda s: s[0], reverse=True
+                    if key not in children or est + bonus > sum(children[key][:2]):
+                        children[key] = (est, bonus, new)
+            valid, tried = [], 0
+            for _est, bonus, new in sorted(
+                children.values(), key=lambda s: s[0] + s[1], reverse=True
             ):
-                if len(next_beam) >= BEAM_WIDTH or tried >= BEAM_EVAL:
+                if len(valid) >= 2 * BEAM_WIDTH or tried >= BEAM_EVAL:
                     break
                 if time.process_time() > deadline:
                     break
@@ -422,13 +512,13 @@ class Player7(Player):
                     continue
                 result = validate_construction(construction, self.room, self.inventory)
                 if result.valid:
-                    next_beam.append(
-                        (score_construction(result, self.weights), new, construction)
-                    )
-            beam = next_beam
-            for state in beam:
-                if best is None or state[0] > best[0]:
-                    best = state
+                    score = score_construction(result, self.weights)
+                    valid.append((score, bonus, new, construction))
+            for score, _bonus, new, construction in valid:
+                if best is None or score > best[0]:
+                    best = (score, new, construction)
+            valid.sort(key=lambda s: s[0] + s[1], reverse=True)
+            beam = [(score, new, cons) for score, _b, new, cons in valid[:BEAM_WIDTH]]
         return best
 
     def _best_rectangles(self, deadline, k, headings):
@@ -504,7 +594,7 @@ class Player7(Player):
             x += sx
         return best
 
-    def _octilinear_bases(self, deadline, k):
+    def _octilinear_bases(self, deadline, k, headings=OCT_HEADINGS):
         """Up to k highest-scoring octagons with faces E=W=a, NE=SW=c, N=S=b,
         NW=SE=d that fit somewhere in the room. With integer faces the loop only
         closes if opposite faces have equal totals, but a face may be several
@@ -565,7 +655,7 @@ class Player7(Player):
             if not anchors:
                 continue
             attempts += 1
-            verts = self._place(_octagon_verts(a, b, cc, d), anchors)
+            verts = self._place(_octagon_verts(a, b, cc, d), anchors, headings)
             if verts is None:
                 continue
             construction = self._to_construction(verts)
@@ -589,12 +679,12 @@ class Player7(Player):
                 if polygon.contains(Point(x, y)):
                     yield (x, y)
 
-    def _place(self, local, anchors):
+    def _place(self, local, anchors, headings):
         """First anchor/rotation at which this shape (centered on its centroid)
         fits in the room, or None. Turning one of these octagons by 45 degrees
         gives another candidate, so rotations below 45 degrees are enough."""
         for ax, ay in anchors:
-            for heading in OCT_HEADINGS:
+            for heading in headings:
                 t = math.radians(heading)
                 ct, st = math.cos(t), math.sin(t)
                 pts = [(ax + x * ct - y * st, ay + x * st + y * ct) for x, y in local]
@@ -604,12 +694,17 @@ class Player7(Player):
 
     def _tab_moves(self, verts, deadline):
         """Every buildable tab on every edge of this (clean, CCW) outline, each at
-        the deepest depth that fits. Yields (estimated pre-gate score, new
-        outline). The estimate is exact for area and perimeter: a w x h tab adds
-        w*h area and 2h perimeter wherever it sits. Edges may run in any of the
-        shape's eight directions; a tab's sides are perpendicular to its edge,
-        so they stay in those directions too."""
+        the deepest depth that fits. Yields (estimated pre-gate score, open-room
+        bonus, new outline). The estimate is exact for area and perimeter: a
+        w x h tab adds w*h area and 2h perimeter wherever it sits. The bonus
+        rewards tabs with room left ahead of them: from the tab's outer edge,
+        straight out (the way the next tab would grow), how far a strip of the
+        same width runs before a wall, capped at the longest face; it is
+        OPEN_BONUS times the area a tab of the same width could still add. Edges may run in any of
+        the shape's eight directions; a tab's sides are perpendicular to its
+        edge, so they stay in those directions too."""
         A, C = self.weights.A, self.weights.C
+        grow = OPEN_BONUS * max(A, 0.0)
         poly = Polygon(verts)
         base = A * poly.area + C * poly.length
         poly_prep = prep(poly)
@@ -618,9 +713,12 @@ class Player7(Player):
             if time.process_time() > deadline:
                 return
             p, q = verts[i], verts[(i + 1) % n]
-            length = round(math.hypot(q[0] - p[0], q[1] - p[1]))
+            raw = math.hypot(q[0] - p[0], q[1] - p[1])
+            length = round(raw)
             if length < c.MIN_WALL_LENGTH:
                 continue
+            dx, dy = (q[0] - p[0]) / raw, (q[1] - p[1]) / raw
+            nx, ny = dy, -dx  # outward normal for a counter-clockwise loop
             for s in [0] + self._buildables:  # 0 = tab flush to this corner
                 if s > length - c.MIN_WALL_LENGTH:
                     break
@@ -633,8 +731,12 @@ class Player7(Player):
                     h = self._deepest_tab(verts, i, s, w, poly_prep)
                     if h is None:
                         continue
+                    mx = p[0] + dx * (s + w / 2) + nx * h
+                    my = p[1] + dy * (s + w / 2) + ny * h
+                    ahead = self._strip_ahead(mx, my, nx, ny, w)
                     yield (
                         base + A * w * h + C * 2 * h,
+                        grow * w * min(ahead, c.MAX_FACE_LENGTH),
                         _clean(_annex(verts, i, s, w, h)),
                     )
 
