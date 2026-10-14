@@ -1,5 +1,7 @@
 import math
+import time
 from collections import Counter
+from itertools import combinations_with_replacement, product
 
 from shapely import Polygon
 
@@ -14,6 +16,7 @@ class Player6(Player):
 
     GATE = 0
     WALL = 1
+    SEARCH_SECONDS = 45.0
     STEPS = (
         (1, 0),
         (0, 1),
@@ -35,6 +38,9 @@ class Player6(Player):
         def __str__(self) -> str:
             return f"Edge{{pieces={self.pieces}, length={self.length:d}, straight_count={self.straight_count:d}}}"
 
+        def __repr__(self):
+            return self.__str__()
+
     class Shape:
         """Store a candidate boundary in traversal order.
         turns[i] is the turn after edges[i], including the closing joint."""
@@ -55,6 +61,20 @@ class Player6(Player):
 
         def to_polygon(self) -> Polygon:
             return Polygon(self.vertices)
+
+        def to_construction_fit(self, fit):
+            _, (theta, tx, ty) = fit
+            # Use the rigid transform directly, preserving the candidate's
+            # first vertex and traversal direction rather than ring ordering.
+            angle = math.radians(theta)
+            x0, y0 = self.vertices[0]
+            x1, y1 = self.vertices[1]
+            start = (
+                x0 * math.cos(angle) - y0 * math.sin(angle) + tx,
+                x0 * math.sin(angle) + y0 * math.cos(angle) + ty,
+            )
+            heading = math.degrees(math.atan2(y1 - y0, x1 - x0)) + theta
+            return self.to_construction(start, heading)
 
         def to_construction(
             self, start: tuple[float, float], start_heading: float
@@ -315,6 +335,251 @@ class Player6(Player):
         )
         return shapes
 
+    def construct(self, polygon: Polygon, fit, c: Shape):
+        _, (theta, tx, ty) = fit
+        # Use the rigid transform directly, preserving the candidate's
+        # first vertex and traversal direction rather than ring ordering.
+        angle = math.radians(theta)
+        x0, y0 = polygon.exterior.coords[0]
+        x1, y1 = polygon.exterior.coords[1]
+        start = (
+            x0 * math.cos(angle) - y0 * math.sin(angle) + tx,
+            x0 * math.sin(angle) + y0 * math.cos(angle) + ty,
+        )
+        heading = math.degrees(math.atan2(y1 - y0, x1 - x0)) + theta
+        return c.to_construction(start, heading)
+
+    def check_face_inventory(self, pieces):
+        """Check combined demand for walls and gates without changing stock."""
+        needed = Counter(tuple(piece) for piece in pieces)
+        return all(
+            (
+                self.inventory.gates if kind == Player6.GATE else self.inventory.walls
+            ).get(length, 0)
+            >= count
+            for (kind, length), count in needed.items()
+        )
+
+    def _out_of_time(self):
+        return time.process_time() >= getattr(self, "_deadline", math.inf)
+
+    def _score_upper_bound(self, polygon):
+        """Include the baseline and the largest possible second-gate bonus."""
+        bonus = self.weights.G if sum(self.inventory.gates.values()) >= 2 else 0
+        return (
+            1000
+            + self.weights.A * polygon.area
+            + self.weights.C * polygon.length
+            + bonus
+        )
+
+    def _fit_geometry(self, polygon):
+        """Cache only identical outlines; a failed heuristic fit proves no dominance."""
+        if self._out_of_time() or polygon.area > self.room.polygon.area:
+            return None
+        key = tuple(polygon.exterior.coords)
+        if key not in self._fit_cache:
+            self._fit_cache[key] = find_fit(self.room.polygon, polygon)
+        return self._fit_cache[key]
+
+    def _consider_shape(self, shape, fit):
+        """Save only simulator-validated improvements, using the actual gate faces."""
+        pieces = [piece for edge in shape.edges for piece in edge.pieces]
+        if not any(kind == Player6.GATE for kind, _ in pieces):
+            return None
+        if not self.check_face_inventory(pieces):
+            return None
+        straights = sum(len(edge.pieces) - 1 for edge in shape.edges)
+        if straights > self.inventory.connectors.get(ConnectorType.STRAIGHT, 0):
+            return None
+        construction = shape.to_construction_fit(fit)
+        result = validate_construction(construction, self.room, self.inventory)
+        if not result.valid:
+            return None
+        score = score_construction(result, self.weights)
+        if score > self.best_score:
+            self.best_score = score
+            self.best_shape = shape
+            self.best_fit = fit
+            self.best_construction = construction
+        return score
+
+    def enumerate_faces(self, max_length=31):
+        """Build length-indexed face compositions without permutation duplicates."""
+        gate_sizes = {
+            length
+            for length, count in self.inventory.gates.items()
+            if 5 <= length <= 30 and count > 0
+        }
+        wall_sizes = {
+            length
+            for length, count in self.inventory.walls.items()
+            if 5 <= length <= 30 and count > 0
+        }
+        lengths = gate_sizes | wall_sizes
+        if not lengths:
+            return self.possible_faces
+        start = max(self.possible_faces, default=min(lengths) - 1) + 1
+        straight_count = self.inventory.connectors.get(ConnectorType.STRAIGHT, 0)
+        for length in range(start, min(max_length, 31)):
+            if self._out_of_time():
+                break
+            possible = []
+            if length in gate_sizes:
+                possible.append([(Player6.GATE, length)])
+            if length in wall_sizes:
+                possible.append([(Player6.WALL, length)])
+            for previous_length, constructions in self.possible_faces.items():
+                new_length = length - previous_length
+                for constructed in constructions:
+                    # Adding one piece requires len(constructed) straight joints.
+                    if len(constructed) > straight_count:
+                        continue
+                    for kind, sizes in (
+                        (Player6.GATE, gate_sizes),
+                        (Player6.WALL, wall_sizes),
+                    ):
+                        if new_length not in sizes:
+                            continue
+                        piece = (kind, new_length)
+                        if (new_length, kind) < (
+                            constructed[-1][1],
+                            constructed[-1][0],
+                        ):
+                            continue
+                        candidate = constructed + [piece]
+                        if self.check_face_inventory(candidate):
+                            possible.append(candidate)
+            if possible:
+                self.possible_faces[length] = possible
+        return self.possible_faces
+
+    def generate_quads(self):
+        """Enumerate rectangles, then lazily assign inventory-backed face pieces."""
+        if self.inventory.connectors.get(ConnectorType.RIGHT, 0) < 4:
+            return [], []
+        valid_quads, invalid_quads = [], []
+        lengths = sorted(self.possible_faces)
+        for i in lengths:
+            for j in lengths:
+                if self._out_of_time():
+                    return valid_quads, invalid_quads
+                if j < i:
+                    continue
+                coords = [(0, 0), (i, 0), (i, j), (0, j)]
+                polygon = Polygon(coords)
+                upper = self._score_upper_bound(polygon)
+                if upper <= self.best_score:
+                    continue
+                fit = self._fit_geometry(polygon)
+                if fit is None:
+                    invalid_quads.append((i, j))
+                    # A timeout or limited-angle failure is not proof that
+                    # larger rectangles cannot fit. Do not prune other sizes.
+                    continue
+                valid_quads.append((i, j))
+
+                if i == j:
+                    combinations = combinations_with_replacement(
+                        self.possible_faces[i], 4
+                    )
+                else:
+                    # Keep the Cartesian product lazy: materializing all pairs
+                    # can consume substantial memory before finding a match.
+                    combinations = (
+                        (first[0], second[0], first[1], second[1])
+                        for first in combinations_with_replacement(
+                            self.possible_faces[i], 2
+                        )
+                        for second in combinations_with_replacement(
+                            self.possible_faces[j], 2
+                        )
+                    )
+                for compositions in combinations:
+                    if self._out_of_time():
+                        return valid_quads, invalid_quads
+                    edges = [
+                        Player6.Edge(list(pieces), length, len(pieces) - 1)
+                        for pieces, length in zip(compositions, (i, j, i, j))
+                    ]
+                    shape = Player6.Shape(edges, [90] * 4, coords)
+                    score = self._consider_shape(shape, fit)
+                    if score is not None and score >= upper:
+                        break
+        return valid_quads, invalid_quads
+
+    def generate_quad_shapes(self):
+        """Search L outlines; fit caching never skips alternative material assignments."""
+        if self.inventory.connectors.get(ConnectorType.RIGHT, 0) < 6:
+            return
+        lengths = sorted(self.possible_faces)
+        for i in lengths:
+            i_groups = {}
+            for pieces in self.possible_faces[i]:
+                if len(pieces) > 1:
+                    i_groups.setdefault(pieces[0][1], []).append(pieces)
+            for j in lengths:
+                if self._out_of_time():
+                    return
+                if j < i:
+                    continue
+                j_groups = {}
+                for pieces in self.possible_faces[j]:
+                    if len(pieces) > 1:
+                        j_groups.setdefault(pieces[0][1], []).append(pieces)
+                for split_i, i_options in i_groups.items():
+                    for split_j, j_options in j_groups.items():
+                        if self._out_of_time():
+                            return
+                        coords = [
+                            (0, 0),
+                            (split_i, 0),
+                            (split_i, split_j),
+                            (i, split_j),
+                            (i, j),
+                            (0, j),
+                        ]
+                        polygon = Polygon(coords)
+                        upper = self._score_upper_bound(polygon)
+                        if upper <= self.best_score:
+                            continue
+                        # Cache by the complete outline, including outer dimensions.
+                        # A failed larger L must not reject a smaller L.
+                        fit = self._fit_geometry(polygon)
+                        if fit is None:
+                            continue
+                        combinations = product(
+                            i_options,
+                            j_options,
+                            self.possible_faces[i],
+                            self.possible_faces[j],
+                        )
+                        for i_sel, j_sel, i_second, j_second in combinations:
+                            if self._out_of_time():
+                                return
+                            face_pieces = [
+                                [i_sel[0]],
+                                [j_sel[0]],
+                                i_sel[1:],
+                                j_sel[1:],
+                                i_second,
+                                j_second,
+                            ]
+                            edges = [
+                                Player6.Edge(
+                                    list(pieces),
+                                    sum(p[1] for p in pieces),
+                                    len(pieces) - 1,
+                                )
+                                for pieces in face_pieces
+                            ]
+                            shape = Player6.Shape(
+                                edges, [90, -90, 90, 90, 90, 90], coords
+                            )
+                            score = self._consider_shape(shape, fit)
+                            if score is not None and score >= upper:
+                                break
+
     def find_candidates(self, max_shapes=10) -> list[Shape]:
         """Build the material inventory, enumerate straight-face options, and
         combine them into candidate shapes before room placement."""
@@ -379,33 +644,21 @@ class Player6(Player):
         #
         # PLACEMENT_GUIDE.md covers placing a shape in the room; SIMULATOR_GUIDE.md
         # covers everything else; players/example_player.py is a worked example.
-        candidates = self.find_candidates()
 
-        best_construction = None
-        best_score = 0
-        for c in candidates:
-            P = c.to_polygon()
-            fit = find_fit(self.room.polygon, P)
-            if fit is not None:
-                _, (theta, tx, ty) = fit
-                # Use the rigid transform directly, preserving the candidate's
-                # first vertex and traversal direction rather than ring ordering.
-                angle = math.radians(theta)
-                x0, y0 = c.vertices[0]
-                x1, y1 = c.vertices[1]
-                start = (
-                    x0 * math.cos(angle) - y0 * math.sin(angle) + tx,
-                    x0 * math.sin(angle) + y0 * math.cos(angle) + ty,
-                )
-                heading = math.degrees(math.atan2(y1 - y0, x1 - x0)) + theta
-                construction = c.to_construction(start, heading)
-                result = validate_construction(construction, self.room, self.inventory)
-                if not result.valid:
-                    continue
-                # Include the baseline and second-gate bonus, exactly as the simulator does.
-                score = score_construction(result, self.weights)
-                if score > best_score:
-                    best_score = score
-                    best_construction = construction
+        # Keep the supplied inventory unchanged, and return the best validated
+        # construction before the submission checker's 60-second CPU limit.
+        self._deadline = time.process_time() + self.SEARCH_SECONDS
+        self._fit_cache = {}
+        self.best_shape = None
+        self.best_fit = None
+        self.best_score = 0
+        self.best_construction = None
 
-        return best_construction
+        self.possible_faces = {}
+        if not self.inventory.has_gate():
+            return None
+        self.enumerate_faces()
+        self.generate_quads()
+        self.generate_quad_shapes()
+
+        return self.best_construction
