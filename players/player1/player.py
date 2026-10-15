@@ -6,7 +6,8 @@ run a local search for an equal share of the time budget:
 score the loop's neighbors with the simulator's own validator and draw one
 with probability ~ exp(gain / temperature). Every move keeps the loop closed
 by construction, so a candidate only ever fails on containment or inventory.
-Return the best loop seen, or None if no rectangle fits.
+Return the best loop seen, with a second gate added if one fits, or None if
+no rectangle fits.
 """
 
 import functools
@@ -528,6 +529,11 @@ class Player1(Player):
                 self.local_search(start, stop - time.process_time(), random_state)
             )
         best, score = max(results, key=lambda result: result[1])
+        # G: a second gate, if any face can take one
+        for gated in add_gate_to_face(best, self.inventory):
+            gated_score = self.evaluate(gated)
+            if gated_score is not None and gated_score > score:
+                best, score = gated, gated_score
         self.note = f"{len(placements)} initial solutions; best {score:.0f} ({len(best.faces)} faces)"
         # A: an enclosure that scores below zero is worse than none at all
         if score <= 0:
