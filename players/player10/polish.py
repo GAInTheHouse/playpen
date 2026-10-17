@@ -67,9 +67,7 @@ class Polisher:
         variants that could score above `floor` are offered."""
         if any(abs(t) != 90 for t in shape.turns):
             return  # diagonal faces: not handled here
-        poly = orient(
-            Polygon([(round(x), round(y)) for x, y in shape.vertices()]), 1.0
-        )
+        poly = orient(Polygon([(round(x), round(y)) for x, y in shape.vertices()]), 1.0)
         # the room as seen from the shape's frame
         region = affinity.rotate(
             affinity.translate(self.region, -start[0], -start[1]),
@@ -93,7 +91,11 @@ class Polisher:
                     a = (p[0] + d[0] * s, p[1] + d[1] * s)
                     b = (a[0] + d[0] * w, a[1] + d[1] * w)
                     free = self._free_depth(a, b, out, region)
-                    moves = [(depth, 1) for depth in {free, free // 2, 5} if 1 <= depth <= free]
+                    moves = [
+                        (depth, 1)
+                        for depth in {free, free // 2, 5}
+                        if 1 <= depth <= free
+                    ]
                     moves += [(depth, -1) for depth in CUT_DEPTHS]
                     for depth, sign in moves:
                         rect = _rect(a, b, out, sign * depth)

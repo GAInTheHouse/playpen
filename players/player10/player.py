@@ -1,15 +1,17 @@
 import heapq
 import math
 import time
-
+from collections import Counter
 from itertools import islice
-from players.player10.polish import Polisher
 
 import src.constants as c
 from players.player0 import Player
 from players.player10.assign import Assigner, Assignment
-from players.player10.freeform import Faces, Grower, Loop
+from players.player10.beam import free_shapes
+from players.player10.freeform import Faces, Grower, Loop, area_of, corners
 from players.player10.placement import RoomSearch
+from players.player10.polish import Polisher
+from players.player10.raster import raster_loops
 from players.player10.shapes import (
     CORNERS_NEEDED,
     HEADING_STEP_DEG,
@@ -30,16 +32,28 @@ from players.player10.shapes import (
 )
 from src.enclosure import Construction, score_construction, validate_construction
 from src.pieces import Connector, ConnectorType, Piece, PieceType
-from players.player10.freeform import free_shapes
 
 # CPU seconds the search may use. Nothing can interrupt a player on Windows, so
 # the player has to stop itself well inside the simulator's limit.
-TIME_BUDGET = 42.0
+TIME_BUDGET = 46.0
 # how far into the budget each stage of the search may run; growing gets the rest
-RECTANGLE_SHARE = 0.12
-L_SHARE = 0.25
-OCTAGON_SHARE = 0.42
-U_SHARE = 0.55
+RECTANGLE_SHARE = 0.10
+L_SHARE = 0.20
+OCTAGON_SHARE = 0.32
+U_SHARE = 0.42
+# Filling the room with grid cells (raster.py): the cell sides tried, and the most
+# time it may take. Only sides whose every multiple up to the face limit can be
+# built are used, paired so that one-cell steps use the most plentiful pieces.
+RASTER_SIZES = (5, 6, 7, 8, 9, 10, 12, 15)
+RASTER_PAIRS = 8
+RASTER_SECONDS = 8.0
+RASTER_MAX_FACES = 900  # piece assignment walks the faces one level deep each
+BEAM_SHARE = 0.55  # free-form loops walked along the walls (beam.py)
+# The walk only wins in small, tightly stocked rooms, where it finds its answer
+# in a second or two; in a big room it would take time that growing needs more.
+BEAM_SECONDS = 3.0
+GROW_SHARE = 0.96  # growing the best shapes found so far (freeform.py)
+# polishing the best rectilinear shape (polish.py) gets the rest
 # growing asks for pieces for thousands of loops, so each ask gets less effort
 GROW_ASSIGN_NODES = 3000
 MAX_SEEDS = 6
@@ -50,8 +64,6 @@ FALLBACK_BUDGET = 3.0
 FALLBACK_SHAPES = 40
 RECENT_FAILURES = 400
 SHRINK_STEPS = 4
-FREE_BUDGET = 40.0
-POLISH_BUDGET = 20.0  # CPU seconds for the polish pass
 POLISH_TRIES = 300  # candidates tried per round before giving up
 
 Candidate = tuple[float, str, tuple[int, ...]]
@@ -109,7 +121,25 @@ class Player10(Player):
             if wanted:
                 self._deadline = started + TIME_BUDGET * share
                 self._search([x for f in wanted for x in self._candidates(f, bonus)])
-        self._grow(started + TIME_BUDGET)
+
+        self._raster(
+            min(
+                started + TIME_BUDGET * GROW_SHARE, time.process_time() + RASTER_SECONDS
+            )
+        )
+
+        # free-form loops walked along the walls: they only have to beat the
+        # best family shape, and every one that is valid also seeds growing
+        self._deadline = min(
+            started + TIME_BUDGET * BEAM_SHARE, time.process_time() + BEAM_SECONDS
+        )
+        self._freeform(bonus)
+
+        self._grow(started + TIME_BUDGET * GROW_SHARE)
+
+        self._deadline = started + TIME_BUDGET
+        self._polish(bonus)
+
         if self._best is None and not self.note:
             self.note = "nothing the inventory can build fits and scores above 0"
 
@@ -181,9 +211,7 @@ class Player10(Player):
         if not result.valid:
             return None
         score = score_construction(result, self.weights)
-        if score > self._best_score:
-            self._best, self._best_score = construction, score
-            self.note = f"{shape.describe()}, score {score:.1f}"
+        self._keep(construction, score, shape, start, first)
         return score
 
     # ------------------------------------------------------------ candidates
@@ -322,20 +350,132 @@ class Player10(Player):
     def _try(self, shape: Shape, assignment: Assignment) -> bool:
         """Place the shape; keep it if it is valid and beats the best so far."""
         for start, heading in self._placements(shape):
-            construction = self._construction(shape, assignment, start, heading)
-            # the simulator's own judge: only what it accepts is ever returned
-            result = validate_construction(construction, self.room, self.inventory)
-            if not result.valid:
-                continue
-            score = score_construction(result, self.weights)
-            self._seeds.append(Loop(start, heading, headed_faces(shape), score))
-            if shape.family == RECTANGLE:
-                self._rectangle = (shape, (start, heading), score)
-            if score > self._best_score:
-                self._best, self._best_score = construction, score
-                self.note = f"{shape.describe()}, score {score:.1f}"
-            return True
+            if self._try_fixed(shape, assignment, start, heading):
+                return True
         return False
+
+    def _try_fixed(
+        self,
+        shape: Shape,
+        assignment: Assignment,
+        start: tuple[float, float],
+        heading: float,
+    ) -> bool:
+        """Build at a known start and heading; True if the simulator accepts it.
+        Every accepted shape is also kept as a seed for growing."""
+        construction = self._construction(shape, assignment, start, heading)
+        # the simulator's own judge: only what it accepts is ever returned
+        result = validate_construction(construction, self.room, self.inventory)
+        if not result.valid:
+            return False
+        score = score_construction(result, self.weights)
+        self._seeds.append(Loop(start, heading, headed_faces(shape), score))
+        if shape.family == RECTANGLE:
+            self._rectangle = (shape, (start, heading), score)
+        self._keep(construction, score, shape, start, heading)
+        return True
+
+    def _keep(self, construction, score, shape, start, heading) -> None:
+        """Remember the best construction, and the shape it came from for the
+        polish pass."""
+        if score > self._best_score:
+            self._best, self._best_score = construction, score
+            self._best_shape, self._best_start, self._best_heading = (
+                shape,
+                start,
+                heading,
+            )
+            self.note = f"{shape.describe()}, score {score:.1f}"
+
+    def _raster(self, deadline: float) -> None:
+        """Outlines of the room filled with grid cells (see raster.py)."""
+        lengths = set(self._assigner.lengths)
+        top = int(c.MAX_FACE_LENGTH)
+        sides = [
+            s
+            for s in RASTER_SIZES
+            if all(k * s in lengths for k in range(1, top // s + 1))
+        ]
+        rights = self.inventory.connectors.get(ConnectorType.RIGHT, 0)
+        if not sides or rights < 4:
+            return
+        # a one-cell step needs a single piece of exactly that length
+        single = {
+            s: self.inventory.walls.get(s, 0) + self.inventory.gates.get(s, 0)
+            for s in sides
+        }
+        pairs = sorted(
+            ((w, h) for w in sides for h in sides),
+            key=lambda p: (-min(single[p[0]], single[p[1]]), p[0] * p[1]),
+        )[:RASTER_PAIRS]
+        for start, heading, faces in raster_loops(
+            self._search_room.region,
+            self.room.polygon,
+            self._search_room.base_headings(90)[:2],
+            pairs,
+            deadline,
+        ):
+            perimeter = sum(n for _, n in faces)
+            if (
+                len(faces) > min(rights, RASTER_MAX_FACES)
+                or perimeter > self._assigner.total_length
+            ):
+                continue
+            area = area_of(corners((0.0, 0.0), faces))
+            if self._score(area, perimeter) + self._bonus <= self._best_score:
+                continue
+            # quick count: sides only one piece can make, against that piece's stock
+            need = Counter(n for _, n in faces if n in single)
+            if any(count > single[n] for n, count in need.items()):
+                continue
+            self._accept_loop(start, heading, tuple(faces))
+
+    def _freeform(self, bonus: float) -> None:
+        """Free-form polygons from the beam search, best-ranked first."""
+        for shape, start, heading in free_shapes(
+            self._search_room,
+            self._assigner,
+            self.inventory,
+            self.weights,
+            self._deadline,
+        ):
+            # the most it could score; skip anything already beaten
+            if self._score(shape.area, shape.perimeter) + bonus <= self._best_score:
+                continue
+            assignment = self._assigner.assign(shape.faces)
+            if assignment is not None:
+                self._try_fixed(shape, assignment, start, heading)
+
+    def _polish(self, bonus: float) -> None:
+        """Grow and trim the best shape by adding or cutting rectangles, keeping
+        each change the simulator accepts that scores higher, until none does."""
+        if self._best_shape is None:
+            return
+        polisher = Polisher(
+            self._search_room.region,
+            self._assigner,
+            self.inventory,
+            lambda area, perimeter: self._score(area, perimeter) + bonus,
+        )
+        while time.process_time() < self._deadline:
+            before = self._best_score
+            for shape, start, heading in islice(
+                polisher.neighbours(
+                    self._best_shape,
+                    self._best_start,
+                    self._best_heading,
+                    before,
+                    self._deadline,
+                ),
+                POLISH_TRIES,
+            ):
+                assignment = self._assigner.assign(shape.faces)
+                if assignment is not None:
+                    self._try_fixed(shape, assignment, start, heading)
+                if self._best_score > before:
+                    break
+            if self._best_score <= before:
+                return
 
     def _placements(self, shape: Shape, limit: int = 3) -> list:
         return self._search_room.place(
@@ -351,7 +491,7 @@ class Player10(Player):
         fails rules out everything that could hold it."""
         failures = self._failures.setdefault(family, [])
         smallest = params
-        if family in (RECTANGLE, OCTAGON):
+        if family in (RECTANGLE, OCTAGON, HEXAGON):
             fitting, failing = 0.0, 1.0
             for _ in range(SHRINK_STEPS):
                 scale = (fitting + failing) / 2.0

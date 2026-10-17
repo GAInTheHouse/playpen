@@ -120,6 +120,10 @@ def _normalise(pos: tuple[float, float], faces: list) -> tuple[tuple, list]:
     return pos, out
 
 
+def _cross(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return a[0] * b[1] - a[1] * b[0]
+
+
 def corners(pos: tuple[float, float], faces) -> list[tuple[float, float]]:
     """The loop's corners in its own frame, the first at `pos`."""
     x, y = pos
@@ -295,6 +299,10 @@ class Grower:
             for f, offset in cuts
         ]
         corner = [offset == 0 for _, offset in cuts]
+        # Sliding the run from cut i to cut j by a vector v sweeps out a
+        # parallelogram of area cross(at[j] - at[i], v), whatever the run's shape,
+        # so a candidate's area needs no fresh walk round its outline.
+        area = area_of(starts)
         far = n if n <= ALL_CORNERS_UP_TO else CORNER_REACH
         seen = set()
         found = []
@@ -332,6 +340,9 @@ class Grower:
                         or ((after - back) % 8 in SHARP and not joins_last)
                     ):
                         continue
+                    chord_x, chord_y = at[j][0] - at[i][0], at[j][1] - at[i][1]
+                    ux, uy = DIRECTIONS[g]
+                    sweep = chord_x * uy - chord_y * ux
                     for d in slides:
                         pos, new = _normalise(
                             at[j], rest + [(g, d)] + run + [(back, d)]
@@ -343,11 +354,12 @@ class Grower:
                         if key2 in seen:
                             continue
                         seen.add(key2)
-                        worth = self._worth(pos, new)
+                        worth = self._worth(new, area - d * sweep)
                         if worth is not None:
                             found.append((pos, key2[2], *worth))
                 if not self.notches:
                     continue
+                chord_x, chord_y = at[j][0] - at[i][0], at[j][1] - at[i][1]
                 for g1 in (1, 3, 5, 7):
                     for g2 in ((g1 + 2) % 8, (g1 - 2) % 8):
                         if (g1 - before) % 8 in SHARP or (first - g2) % 8 in SHARP:
@@ -356,6 +368,15 @@ class Grower:
                         for t1, t2 in ((b1, b2), (b2, b1)):
                             if (t1 - last) % 8 in SHARP or (after - t2) % 8 in SHARP:
                                 continue
+                            vx = DIRECTIONS[g1][0] + DIRECTIONS[g2][0]
+                            vy = DIRECTIONS[g1][1] + DIRECTIONS[g2][1]
+                            sweep = chord_x * vy - chord_y * vx
+                            # each end of the slide is two faces, not one: a
+                            # small triangle of d * d / 2 on each, in or out
+                            corner_area = (
+                                _cross(DIRECTIONS[g1], DIRECTIONS[g2])
+                                + _cross(DIRECTIONS[t1], DIRECTIONS[t2])
+                            ) / 2.0
                             for d in self.smallest:
                                 pos, new = _normalise(
                                     at[j],
@@ -371,7 +392,9 @@ class Grower:
                                 if key2 in seen:
                                     continue
                                 seen.add(key2)
-                                worth = self._worth(pos, new)
+                                worth = self._worth(
+                                    new, area - d * sweep + d * d * corner_area
+                                )
                                 if worth is not None:
                                     found.append((pos, key2[2], *worth))
         self._remembered[key] = found
@@ -389,7 +412,7 @@ class Grower:
         found.sort(key=lambda f: -f[0])
         return found
 
-    def _worth(self, pos, faces) -> tuple[float, int] | None:
+    def _worth(self, faces, area: float) -> tuple[float, int] | None:
         """The most this loop could score and how far its faces are from
         lengths that can be built, or None if the stock rules it out."""
         rights = diagonals = perimeter = over = 0
@@ -416,7 +439,6 @@ class Grower:
             return None
         if perimeter > self.total_length:
             return None
-        area = area_of(corners(pos, faces))
         if area <= 0:
             return None
         return self.score(area, perimeter), over

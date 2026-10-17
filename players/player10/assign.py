@@ -51,6 +51,7 @@ class Assigner:
                     gated[:MAX_COMPOSITIONS],
                 )
         self.lengths = sorted(self.compositions)
+        self._choices = {n: len(a) + len(b) for n, (a, b) in self.compositions.items()}
         self._cache: dict[tuple[int, ...], tuple | None] = {}
         self.max_nodes = MAX_SEARCH_NODES
 
@@ -76,7 +77,9 @@ class Assigner:
     def assign(self, faces: tuple[int, ...]) -> Assignment | None:
         """Pieces for every face, with a gate on two different faces if that is
         wanted and possible, otherwise on one. None if the stock can't do it."""
-        ordered = tuple(sorted(faces, reverse=True))
+        # the faces with the fewest ways to be built go first, so the pieces
+        # only they can use are not taken by faces that had other choices
+        ordered = tuple(sorted(faces, key=lambda n: (self._choices.get(n, 0), -n)))
         if ordered not in self._cache:
             self._cache[ordered] = self._solve(ordered)
         solved = self._cache[ordered]
