@@ -7,7 +7,7 @@ from shapely import Polygon
 
 from players.player0 import Player
 from players.player6.diagonal_search import DiagonalSearch
-from players.player6.polygon import find_fit
+from players.player6.polygon import find_fit, place_at_angle
 from src.enclosure import Construction, score_construction, validate_construction
 from src.pieces import Connector, ConnectorType, Piece, PieceType
 
@@ -19,6 +19,12 @@ class Player6(Player):
     WALL = 1
     SEARCH_SECONDS = 45.0
     DIAGONAL_SECONDS = 20.0
+    # Hard cap on the inscribed-polygon solver, which has no natural stopping
+    # point (it tries up to 26 cell sizes, each with a shrink bisection).
+    INSCRIBED_SECONDS = 25.0
+    # Time spent turning that solution's staircases into diagonals.
+    INSCRIBED_DIAGONAL_SECONDS = 15.0
+    INSCRIBED_DIAGONALS = True
     STEPS = (
         (1, 0),
         (0, 1),
@@ -642,9 +648,10 @@ class Player6(Player):
         solved, plan, why = solve_with_stock(
             self.room.polygon,
             combined_inventory,
-            cells=tuple(range(5,31)),
+            cells=tuple(range(5, 31)),
             must_use=list(self.inventory.gates.keys()),
             angle_stock=self.inventory.connectors,
+            deadline=time.process_time() + self.INSCRIBED_SECONDS,
         )
         if solved is None:
             return
@@ -701,7 +708,80 @@ class Player6(Player):
 
         shape = Player6.Shape(edges, angles, coords)
 
-        self._consider_shape(shape, (None, (0, 0, 0)))
+        base_score = self._consider_shape(shape, (None, (0, 0, 0)))
+        if self.INSCRIBED_DIAGONALS:
+            self.diagonalize_inscribed(coords, base_score)
+
+    def diagonalize_inscribed(self, coords, base_score):
+        """Replace pairs of opposite staircases of the inscribed polygon with
+        diagonals (see inscribed_diagonal.py), greedily, keeping any change
+        that the simulator scores higher."""
+        from players.player6 import inscribed_diagonal as idg
+
+        conn = self.inventory.connectors
+        max_diag = conn.get(ConnectorType.DIAGONAL, 0)
+        max_right = conn.get(ConnectorType.RIGHT, 0)
+        faces = idg.to_faces(coords)
+        if max_diag < 2 or faces is None:
+            return
+        lengths, turns, alpha = faces
+        deadline = time.process_time() + self.INSCRIBED_DIAGONAL_SECONDS
+        realizer = DiagonalSearch(
+            self.room,
+            self.inventory,
+            self.weights,
+            time_budget=1e9,
+            face_library=self.possible_faces or None,
+        )
+        realizer.prepare_inventory()
+        room_poly = self.room.polygon
+        cur_score = base_score if base_score is not None else -math.inf
+
+        for _round in range(6):
+            best_var = None
+            for w1, w2 in idg.pairs(lengths, turns):
+                for diag_len in idg.diag_lengths(w1["a"]):
+                    if time.process_time() >= deadline or self._out_of_time():
+                        return
+                    var = idg.apply_pair(lengths, turns, w1, w2, diag_len)
+                    if var is None:
+                        continue
+                    new_len, new_turn, head0 = var
+                    n_diag = sum(1 for t in new_turn if abs(t) == 1)
+                    n_right = sum(1 for t in new_turn if abs(t) == 2)
+                    if n_diag > max_diag or n_right > max_right:
+                        continue
+                    verts, closure = idg.walk(new_len, new_turn)
+                    if closure != (0, 0, 0, 0):
+                        continue
+                    poly = Polygon(verts)
+                    if not poly.is_valid or poly.area <= 0:
+                        continue
+                    if self._score_upper_bound(poly) <= max(self.best_score, cur_score):
+                        continue
+                    if any(ln not in realizer.comps for ln in new_len):
+                        continue  # a face length the inventory cannot build
+                    assign = realizer.realize(tuple(sorted(new_len)))
+                    if assign is None:
+                        continue
+                    pool = {}
+                    for ln, comp in zip(sorted(new_len), assign):
+                        pool.setdefault(ln, []).append(comp)
+                    comps = [pool[ln].pop(0) for ln in new_len]
+                    edges = [
+                        Player6.Edge(list(c[0]), ln, c[2])
+                        for ln, c in zip(new_len, comps)
+                    ]
+                    shape = Player6.Shape(edges, [t * 45 for t in new_turn], verts)
+                    placed = place_at_angle(room_poly, poly, alpha + 45.0 * head0)
+                    if placed is None:
+                        continue
+                    score = self._consider_shape(shape, placed)
+                    if score is not None and (best_var is None or score > best_var[0]):
+                        best_var = (score, new_len, new_turn, alpha + 45.0 * head0)
+            if best_var is None or best_var[0] <= cur_score:
+                return
+            cur_score, lengths, turns, alpha = best_var
 
     def build_enclosure(self) -> Construction | None:
         # Set up for you by Player.__init__:
@@ -751,7 +831,7 @@ class Player6(Player):
             area_ratio = best_area / total_area
             # Check how good our best shape is. If we think the solution is better than what we would get using beam search, then just return as is.
             # For now, if we cover the entire polygon or on large rooms, we cover more than half.
-            if area_ratio == 1 or (total_area > 10000 and area_ratio >= 0.5):
+            if area_ratio >= 0.999 or (total_area > 10000 and area_ratio >= 0.5):
                 return self.best_construction
 
         self.generate_quads()

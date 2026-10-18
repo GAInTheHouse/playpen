@@ -15,6 +15,7 @@ Strategy
   3. Return the largest buildable candidate plus the piece plan.
 """
 
+import time
 from collections import Counter
 
 import numpy as np
@@ -23,6 +24,11 @@ from shapely import affinity
 from shapely.geometry import Polygon, box
 
 import players.player6.inscribed_polygon as ip
+
+
+def _expired(deadline):
+    """deadline is an absolute time.process_time() value (None = no limit)."""
+    return deadline is not None and time.process_time() >= deadline
 
 
 # --------------------------------------------------------- piece assignment
@@ -396,7 +402,7 @@ def _shrunk(poly, d):
     return Polygon(p.exterior)
 
 
-def shrink_search(poly, stock, must_use=None, angle_stock=None, **kw):
+def shrink_search(poly, stock, must_use=None, angle_stock=None, deadline=None, **kw):
     """Smallest inward offset d (integer units) whose re-solved boundary is
     buildable. Probes use cheap solver settings; the winning d is re-solved at
     full quality. Not strictly monotone in d, so this is a heuristic bisection."""
@@ -416,6 +422,8 @@ def shrink_search(poly, stock, must_use=None, angle_stock=None, **kw):
 
     lo, d, hit = 0, 1, None
     while True:  # exponential probe
+        if _expired(deadline):
+            return None
         status, r, pl = attempt(d, fast)
         if status == "empty":
             return None
@@ -424,25 +432,30 @@ def shrink_search(poly, stock, must_use=None, angle_stock=None, **kw):
             break
         lo, d = d, d * 2
     hi_d = hit[0]
-    while hi_d - lo > 1:  # bisect
+    while hi_d - lo > 1 and not _expired(deadline):  # bisect
         mid = (lo + hi_d) // 2
         status, r, pl = attempt(mid, fast)
         if status == "ok":
             hi_d, hit = mid, (mid, r, pl)
         else:
             lo = mid
-    status, r, pl = attempt(hit[0], kw)  # full-quality re-solve at the winner
-    if status == "ok" and r.area > hit[1].area:
-        hit = (hit[0], r, pl)
+    if not _expired(deadline):
+        status, r, pl = attempt(hit[0], kw)  # full-quality re-solve at the winner
+        if status == "ok" and r.area > hit[1].area:
+            hit = (hit[0], r, pl)
     return hit[1], hit[2]
 
 
-def _search(poly, stock, cells, must_use, bonus_weight, angle_stock=None, **kw):
+def _search(
+    poly, stock, cells, must_use, bonus_weight, angle_stock=None, deadline=None, **kw
+):
     stock = clean_stock(stock)
     cands = []
     old_cell, old_run = ip.CELL, ip.MAX_RUN
     try:
         for cell in cells:
+            if _expired(deadline):
+                break
             ip.CELL, ip.MAX_RUN = cell, 30 // cell
             r = ip.solve(poly, **kw)
             if r is not None:
@@ -450,7 +463,9 @@ def _search(poly, stock, cells, must_use, bonus_weight, angle_stock=None, **kw):
                 if pl:
                     cands.append((r, pl, f"unconstrained(cell={cell})"))
                     continue
-            sres = shrink_search(poly, stock, must_use, angle_stock, **kw)
+            sres = shrink_search(
+                poly, stock, must_use, angle_stock, deadline=deadline, **kw
+            )
             if sres is not None:
                 cands.append((sres[0], sres[1], f"shrunk(cell={cell})"))
     finally:
@@ -486,6 +501,7 @@ def solve_with_stock(
     bonus_weight=0.0,
     on_class_impossible="fallback",
     angle_stock=None,
+    deadline=None,
     **kw,
 ):
     """
@@ -526,17 +542,19 @@ def solve_with_stock(
         elif not any(class_fits_in_run(stock, must_use, c) for c in cells):
             why = "needs-wall-shifting"
         if why is None:
-            r = _search(poly, stock, cells, must_use, bonus_weight, angle_stock, **kw)
+            r = _search(
+                poly, stock, cells, must_use, bonus_weight, angle_stock, deadline, **kw
+            )
             if r[0] is not None:
                 return r
             why = "class-unbuildable-with-this-stock"
         if on_class_impossible == "fail":
             return None, None, f"infeasible ({why})"
-        r = _search(poly, stock, cells, None, 0.0, angle_stock, **kw)
+        r = _search(poly, stock, cells, None, 0.0, angle_stock, deadline, **kw)
         if r[0] is None:
             return r
         return r[0], r[1], f"{r[2]} [class unused: {why}]"
-    return _search(poly, stock, cells, None, bonus_weight, angle_stock, **kw)
+    return _search(poly, stock, cells, None, bonus_weight, angle_stock, deadline, **kw)
 
 
 def diagnose_class(poly, stock, must_use, cells=(5, 10, 15), **kw):
