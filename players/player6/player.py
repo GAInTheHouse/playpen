@@ -626,6 +626,82 @@ class Player6(Player):
 
         return rectangles + shape_options
 
+    def full_checks(self):
+        from players.player6.inscribed_polygon_stock import (
+            clean_stock,
+            solve_with_stock,
+        )
+
+        combined_inventory = self.inventory.walls.copy()
+        for k, v in self.inventory.gates.items():
+            if k in combined_inventory:
+                combined_inventory[k] += v
+            else:
+                combined_inventory[k] = v
+
+        solved, plan, why = solve_with_stock(
+            self.room.polygon,
+            combined_inventory,
+            must_use=list(self.inventory.gates.keys()),
+            angle_stock=self.inventory.connectors,
+        )
+        if solved is None:
+            return
+
+        coords = list(solved.exterior.coords)[:-1]
+        n_coords = len(coords)
+        lengths = []
+        angles = []
+        for i in range(n_coords):
+            prev, curr, next = coords[i - 1], coords[i], coords[(i + 1) % n_coords]
+            length = math.hypot(next[0] - curr[0], next[1] - curr[1])
+            v1, v2 = (
+                (curr[0] - prev[0], curr[1] - prev[1]),
+                (next[0] - curr[0], next[1] - curr[1]),
+            )
+            turn = math.degrees(
+                math.atan2(v1[0] * v2[1] - v1[1] * v2[0], v1[0] * v2[0] + v1[1] * v2[1])
+            )
+            interior = 180 - turn
+            lengths.append(length)
+            angles.append(interior)
+
+        edges = []
+        gates = clean_stock(self.inventory.gates.copy())
+        for l in lengths:
+            stock: list = plan[round(l)]
+            sizes, inv = stock[0]
+
+            edge_sizes = []
+            for size in sizes:
+                # Prioritize gates
+                if size in gates:
+                    edge_sizes.append((Player6.GATE, size))
+                    gates[size] -= 1
+                    if gates[size] == 0:
+                        del gates[size]
+                else:
+                    edge_sizes.append((Player6.WALL, size))
+            edges.append(
+                Player6.Edge(
+                    edge_sizes,
+                    round(l),
+                    len(sizes) - 1,
+                )
+            )
+
+            stock[0] = (sizes, inv - 1)
+            if inv - 1 == 0:
+                stock.pop(0)
+
+        angles = [round(180 - a) for a in angles]
+        angles = [180 if a == 0 else a for a in angles]
+        angles = angles[1:] + angles[:1]
+
+        shape = Player6.Shape(edges, angles, coords)
+
+        self._consider_shape(shape, (None, (0, 0, 0)))
+
     def build_enclosure(self) -> Construction | None:
         # Set up for you by Player.__init__:
         #   self.room       the room footprint (self.room.polygon is a shapely Polygon;
@@ -666,6 +742,17 @@ class Player6(Player):
         if not self.inventory.has_gate():
             return None
         self.enumerate_faces()
+        self.full_checks()
+
+        if self.best_shape:
+            best_area = self.best_shape.to_polygon().area
+            total_area = self.room.polygon.area
+            area_ratio = best_area / total_area
+            # Check how good our best shape is. If we think the solution is better than what we would get using beam search, then just return as is.
+            # For now, if we cover the entire polygon or on large rooms, we cover more than half.
+            if area_ratio == 1 or (total_area > 10000 and area_ratio >= 0.5):
+                return self.best_construction
+
         self.generate_quads()
         self.generate_quad_shapes()
 
