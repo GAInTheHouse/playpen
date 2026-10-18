@@ -78,8 +78,7 @@ def _seg_dist(x, y, edge):
     (ax, ay), (bx, by) = edge
     dx, dy = bx - ax, by - ay
     seg = dx * dx + dy * dy
-    t = 0.0 if seg == 0 else max(
-        0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / seg))
+    t = 0.0 if seg == 0 else max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / seg))
     return math.hypot(x - ax - t * dx, y - ay - t * dy)
 
 
@@ -190,8 +189,7 @@ def hexagon_tilted(a, b, c):
 def l_shape(a1, a2, b1, b2):
     """Bottom a1+a2 wide, right arm b1 high, left arm b1+b2 high and a1 wide."""
     return Shape(
-        "L", (a1, a2, b1, b2), [0, 2, 4, 2, 4, 6], [
-            a1 + a2, b1, a2, b2, a1, b1 + b2]
+        "L", (a1, a2, b1, b2), [0, 2, 4, 2, 4, 6], [a1 + a2, b1, a2, b2, a1, b1 + b2]
     )
 
 
@@ -261,8 +259,7 @@ class Stock:
         if total > 0:
             rec(total, 0, [])
         # fewest pieces first, then prefer the lengths we have plenty of
-        found.sort(key=lambda p: (len(p), sum(
-            1.0 / self.counts[n] for n in p)))
+        found.sort(key=lambda p: (len(p), sum(1.0 / self.counts[n] for n in p)))
         self.ways[total] = found
         return found
 
@@ -428,8 +425,7 @@ class Allocator:
         need = [0] * (n + 1)
         for k in range(n - 1, -1, -1):
             i = order[k]
-            own = 0 if lengths[i] == 0 else stock.fewest(
-                lengths[i]) - 1 + extra[i]
+            own = 0 if lengths[i] == 0 else stock.fewest(lengths[i]) - 1 + extra[i]
             need[k] = need[k + 1] + own
         choice = [None] * n
         nodes = 0
@@ -504,14 +500,12 @@ class Placer:
         n = len(pts)
         self.pts = pts
         self.edges = [(pts[i], pts[(i + 1) % n]) for i in range(n)]
-        self.out_angle = [_angle(b[0] - a[0], b[1] - a[1])
-                          for a, b in self.edges]
+        self.out_angle = [_angle(b[0] - a[0], b[1] - a[1]) for a, b in self.edges]
         self.in_angle = [self.out_angle[i - 1] for i in range(n)]
         self.interior = [
             180.0 - _wrap(self.out_angle[i] - self.in_angle[i]) for i in range(n)
         ]
-        self.edge_len = [math.hypot(b[0] - a[0], b[1] - a[1])
-                         for a, b in self.edges]
+        self.edge_len = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in self.edges]
         self.bounds = room.polygon.bounds
         padded = room.polygon.buffer(TOL)
         self.checker = prep(padded) if prep is not None else padded
@@ -529,8 +523,7 @@ class Placer:
             for b in range(steps + 1):
                 x, y = minx + a * hx, miny + b * hy
                 if _inside(self.pts, x, y):
-                    best = max(best, min(_seg_dist(x, y, e)
-                               for e in self.edges))
+                    best = max(best, min(_seg_dist(x, y, e) for e in self.edges))
         return best + math.hypot(hx, hy) / 2 + 1e-6
 
     def point_ok(self, x, y):
@@ -657,12 +650,10 @@ class Refiner:
         if not shape.axis_only:
             return
         # work in the shape's own frame: rotated by -theta, origin at (0, 0)
-        verts = [_rot(x, y, -theta)
-                 for x, y in shape.world_vertices(theta, tx, ty)]
+        verts = [_rot(x, y, -theta) for x, y in shape.world_vertices(theta, tx, ty)]
         room = [_rot(x, y, -theta) for x, y in self.placer.pts]
         self.room = room
-        room_edges = [(room[i], room[(i + 1) % len(room)])
-                      for i in range(len(room))]
+        room_edges = [(room[i], room[(i + 1) % len(room)]) for i in range(len(room))]
         for _ in range(max_moves):
             if self.out_of_time():
                 return
@@ -827,7 +818,7 @@ class Refiner:
         new += [b, c]
         if post > 0:
             new.append(d)
-        new += verts[i + 1:]
+        new += verts[i + 1 :]
         # drop vertices that became straight
         out = []
         m = len(new)
@@ -1079,8 +1070,7 @@ class GridEngine:
         self.right = connectors["right"]
         self.weights = weights
         self.out_of_time = out_of_time
-        self.total_length = sum(
-            n * k for n, k in allocator.pool.counts.items())
+        self.total_length = sum(n * k for n, k in allocator.pool.counts.items())
         self.side_lengths = [n for n in range(5, 31) if allocator.side_ok(n)]
 
     # grids to try
@@ -1142,8 +1132,7 @@ class GridEngine:
             """Room area in the columns that are inside for the whole slab."""
             if (a, b) not in cache:
                 ya, yb = base + a, base + b
-                iv = _overlap(_crossings(pts, ya + eps),
-                              _crossings(pts, yb - eps))
+                iv = _overlap(_crossings(pts, ya + eps), _crossings(pts, yb - eps))
                 k = bisect.bisect_right(vert_y, ya)
                 while iv and k < len(vert_y) and vert_y[k] < yb:
                     iv = _overlap(iv, _crossings(pts, vert_y[k] - eps))
@@ -1159,8 +1148,7 @@ class GridEngine:
         for t in range(1, top + 1):
             for g in gaps:
                 if t - g >= 0 and dp[t - g] >= 0:
-                    val = dp[t - g] + \
-                        (value(t - g, t) if t - g < span else 0.0)
+                    val = dp[t - g] + (value(t - g, t) if t - g < span else 0.0)
                     if val > dp[t] + 1e-9:
                         dp[t] = val
                         back[t] = t - g
@@ -1306,8 +1294,7 @@ class GridEngine:
                     frontier.append(d)
 
         ranked = sorted(
-            inside, key=lambda c: (-dist.get(c, 0), -
-                                   grid.w[c[0]] * grid.h[c[1]], c)
+            inside, key=lambda c: (-dist.get(c, 0), -grid.w[c[0]] * grid.h[c[1]], c)
         )
         out = []
         for c in ranked:
@@ -1357,8 +1344,7 @@ class GridEngine:
                 continue
             if not region.can_add(c):
                 if tries < 3:  # may become addable once its neighbours are in
-                    heapq.heappush(
-                        heap, (dist(c) + 10.0 * (tries + 1), tries + 1, c))
+                    heapq.heappush(heap, (dist(c) + 10.0 * (tries + 1), tries + 1, c))
                 continue
             i, j = c
             w, h = grid.w[i], grid.h[j]
@@ -1465,8 +1451,7 @@ class GridEngine:
             lengths.append(round(total))
         if any(n < 5 or n > 30 for n in lengths):
             return None
-        shape = Shape("grid", (len(region.cells),), [
-                      r[0][0] for r in runs], lengths)
+        shape = Shape("grid", (len(region.cells),), [r[0][0] for r in runs], lengths)
         if not shape.valid():
             return None
         vx, vy = runs[0][0][1]
@@ -1538,8 +1523,7 @@ class GridEngine:
             if "fit" not in (reason or ""):
                 return None
             # the raster was a bit optimistic: drop the cells that poke out
-            bad = [c for c in region.cells if not self.placer.fits(
-                grid.corners(c))]
+            bad = [c for c in region.cells if not self.placer.fits(grid.corners(c))]
             if not bad:
                 return None
             for c in bad:
@@ -1671,7 +1655,7 @@ class Player8(Player):
         if shape.axis_only:
             self.seeds.append((score, shape, theta, tx, ty))
             self.seeds.sort(key=lambda t: -t[0])
-            del self.seeds[N_SEEDS * 3:]
+            del self.seeds[N_SEEDS * 3 :]
         if score > self.best_score:
             self.best_score = score
             self.best = construction
@@ -1694,8 +1678,7 @@ class Player8(Player):
             if pieces is None:
                 continue
             desc = label + (" with 2 gates" if n_gates == 2 else "")
-            score, ok, reason = self._commit(
-                shape, pieces, theta, tx, ty, desc)
+            score, ok, reason = self._commit(shape, pieces, theta, tx, ty, desc)
             if ok:
                 return score, ok, reason
         return 0.0, False, reason
@@ -1728,8 +1711,7 @@ class Player8(Player):
         if right >= 4:
             for i, a in enumerate(lengths):
                 for b in lengths[i:]:
-                    add("rect", (a, b), a * b, 2 *
-                        (a + b), math.hypot(a, b), a / 2)
+                    add("rect", (a, b), a * b, 2 * (a + b), math.hypot(a, b), a / 2)
         if diag >= 8:
             for a in lengths:
                 for b in lengths:
@@ -1795,10 +1777,8 @@ class Player8(Player):
                                 u_area = w * b1 + (a1 + a3) * b2
                                 u_r = max(min(w, b1), min(max(a1, a3), h)) / 2
                                 t_r = max(min(w, b1), min(a2, h)) / 2
-                                add("U", p, u_area, 2 *
-                                    (w + h) + 2 * b2, dm, u_r)
-                                add("T", p, w * b1 + a2 *
-                                    b2, 2 * (w + h), dm, t_r)
+                                add("U", p, u_area, 2 * (w + h) + 2 * b2, dm, u_r)
+                                add("T", p, w * b1 + a2 * b2, 2 * (w + h), dm, t_r)
         out.sort(key=lambda t: -t[0])
         return out
 
@@ -1850,8 +1830,7 @@ class Player8(Player):
                     if len(misses) < MAX_FAILED_MEMO:
                         misses.append(key)
                     break
-                desc = f"{family} {params}" + \
-                    (" with 2 gates" if n_gates == 2 else "")
+                desc = f"{family} {params}" + (" with 2 gates" if n_gates == 2 else "")
                 self._commit(shape, pieces, *placement, desc)
 
     # grid outlines
@@ -1933,8 +1912,7 @@ class Player8(Player):
         refiner = Refiner(
             self.placer, lengths, self.weights, self.conn["right"], self._out_of_time
         )
-        angles = sorted({round(a % 90.0, 4)
-                        for a in self.placer.out_angle}) or [0.0]
+        angles = sorted({round(a % 90.0, 4) for a in self.placer.out_angle}) or [0.0]
         misses = 0
         while not self._out_of_time():
             start = self._random_start(rng, lengths[:4], angles)
