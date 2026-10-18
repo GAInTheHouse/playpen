@@ -20,11 +20,15 @@ class Player6(Player):
     # CPU-time budget per method (the hard limit is 300 s for everything):
     #   inscribed polygon solver   <= INSCRIBED_SECONDS (inside the orthogonal window)
     #   orthogonal rect/L search   <= ORTHOGONAL_SECONDS in all, inscribed included
-    #   exact 45-degree beam search <= DIAGONAL_SECONDS
-    # Longer beam budgets were what improved scores in testing; extra time on
-    # the orthogonal side changed nothing.
-    ORTHOGONAL_SECONDS = 40.0
-    DIAGONAL_SECONDS = 150.0
+    #   exact 45-degree beam search: everything left up to TOTAL_SECONDS
+    # In testing the beam kept improving for up to 240 s on some rooms (gaps of
+    # 100+ s between improvements), so an early stop would have cost score;
+    # extra time on the orthogonal side or the inscribed solver changed nothing.
+    ORTHOGONAL_SECONDS = 30.0
+    DIAGONAL_SECONDS = 250.0  # cap; the beam really gets TOTAL_SECONDS - elapsed
+    # Stop the whole search at this CPU time, leaving ~50 s of the 300 s limit
+    # for validation, building the answer and slow machines.
+    TOTAL_SECONDS = 250.0
     # Hard cap on the inscribed-polygon solver, which has no natural stopping
     # point (it tries up to 26 cell sizes, each with a shrink bisection).
     INSCRIBED_SECONDS = 25.0
@@ -853,7 +857,13 @@ class Player6(Player):
                 self.room,
                 self.inventory,
                 self.weights,
-                time_budget=self.DIAGONAL_SECONDS,
+                time_budget=max(
+                    0.0,
+                    min(
+                        self.DIAGONAL_SECONDS,
+                        self.TOTAL_SECONDS - (time.process_time() - t_start),
+                    ),
+                ),
                 face_library=self.possible_faces or None,
             ).build_enclosure()
             self.phase_seconds["diagonal beam"] = time.process_time() - t

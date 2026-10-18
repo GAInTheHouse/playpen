@@ -96,6 +96,7 @@ class DiagonalSearch(Player):
         # process_time() is what the simulator's CPU limit counts; the
         # constructor counts toward it, so the clock starts here.
         self._start = time.process_time()
+        self.history = []  # (seconds since start, score) at each improvement
         super().__init__(*args, **kwargs)
 
     def out_of_time(self) -> bool:
@@ -417,6 +418,9 @@ class DiagonalSearch(Player):
                 score = score_construction(result, self.weights) - BASELINE_SCORE
                 if best is None or score > best[0]:
                     best = (score, key, per_face, fit)
+                    self.history.append(
+                        (round(time.process_time() - self._start, 1), round(score, 1))
+                    )
 
         # Iterative widening: a cheap narrow beam first (answer within a
         # moment), then ever wider ones, until the beam stops truncating
