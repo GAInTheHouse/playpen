@@ -55,6 +55,7 @@ def run_scenario(name: str) -> dict:
     scenario = read_scenario(str(SCENARIO_ROOT / name))
     cpu = CpuLimit(CPU_LIMIT)
     start = time.perf_counter()
+    construction = None
     try:
         # one budget for the whole run: building the player + build_enclosure()
         with cpu:

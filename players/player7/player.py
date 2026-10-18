@@ -23,7 +23,7 @@ RIGHT = [Connector(ConnectorType.RIGHT)] * 4
 DIAGONAL = [Connector(ConnectorType.DIAGONAL)] * 8
 
 # shape search (edge-list beam search) tuning
-SEARCH_CPU_BUDGET = 60.0  # seconds of CPU the shape search may spend
+SEARCH_CPU_BUDGET = 290.0  # seconds of CPU the shape search may spend
 OCT_PLACEMENTS = 1500  # octagon candidates tried for placement before giving up
 OCT_HEADINGS = [i * 7.5 for i in range(6)]  # rotations in [0, 45) when placing
 # tilts for starting rectangles; turning w x h by 90 gives h x w, so [0, 90)
@@ -32,14 +32,17 @@ OCT_GRID = 12  # grid of candidate centers (per axis) for placing octagons
 OCT_ANCHORS = 12  # deepest centers tried per octagon
 POS_STEP = 1.0  # smallest grid step (units) when scanning rectangle positions
 POS_MAX_STEPS = 32  # cap positions per axis so big rooms stay fast
-MAX_ARMS = 30  # beam levels: each level adds one tab (one concave corner)
-BEAM_WIDTH = 6  # shapes kept per level (and per kind of starting shape)
-BEAM_EVAL = 36  # children fully validated per level before moving on
+MAX_ARMS = 180  # beam levels: each level makes one move (tab, stretch or twist)
+BEAM_WIDTH = 20  # shapes kept per level (and per kind of starting shape)
+BEAM_EVAL = 150  # children fully validated per level before moving on
 OPEN_BONUS = 0.5  # weight on the room left ahead of a bump (see _tab_moves)
 OPEN_RAY_STEP = 2.5  # degrees between rays when looking for open directions
 OPEN_DIRECTIONS = 3  # most open directions to tilt starting shapes toward
 OPEN_SEPARATION = 15.0  # degrees two open directions must differ by
-ALLOC_NODES = 2000  # backtracking budget when assigning pieces to faces
+ALLOC_NODES = 10000  # backtracking budget when assigning pieces to faces
+STRETCH_MOVES = True  # lengthen a pair of opposite sides (see _shift_moves)
+TWIST_MOVES = True  # put a 45-degree jog into a pair of opposite sides
+TWIST_CUTS = 4  # cut positions tried per pair of sides when twisting
 
 
 def _vertices(pieces, connectors):
@@ -182,16 +185,43 @@ def _annex(verts, i, s, w, h):
     return verts[: i + 1] + [a, a_out, b_out, b] + verts[i + 1 :]
 
 
+def _point_on(verts, k, s):
+    """The point s units along edge k."""
+    p, q = verts[k], verts[(k + 1) % len(verts)]
+    length = math.hypot(q[0] - p[0], q[1] - p[1])
+    return (p[0] + (q[0] - p[0]) * s / length, p[1] + (q[1] - p[1]) * s / length)
+
+
+def _shift(verts, i, s1, j, s2, v):
+    """Cut the outline from s1 units along edge i to s2 units along edge j and
+    move the part after the first cut (corners i+1 .. j) by the vector v,
+    bridging each cut with a segment equal to v. With v along edge i, both
+    edges just get longer (a stretch); at 45 degrees to it, each gets a
+    diagonal jog (a twist). The loop stays closed: the two bridges cancel."""
+    n = len(verts)
+    c1, c2 = _point_on(verts, i, s1), _point_on(verts, j, s2)
+    fixed = [verts[(j + 1 + k) % n] for k in range((i - j) % n)]
+    moved = [verts[(i + 1 + k) % n] for k in range((j - i) % n)]
+    vx, vy = v
+    return (
+        fixed
+        + [c1, (c1[0] + vx, c1[1] + vy)]
+        + [(x + vx, y + vy) for x, y in moved]
+        + [(c2[0] + vx, c2[1] + vy), c2]
+    )
+
+
 class Player7(Player):
     """Build the best enclosure we can and return it. Two strategies compete and
     the higher-scoring valid one wins:
 
     - "classic": the largest valid rectangle and octagon (good on convex rooms).
     - "search": an edge-list beam search -- start from the best buildable
-      rectangles and octilinear octagons (several rotations), add one
-      rectangular tab (one concave corner) per level, keep the best few shapes
-      per level, return the best seen (good on stars, L-shapes, crosses,
-      slanted rooms...).
+      rectangles and octilinear octagons (several rotations), make one move
+      per level -- add a rectangular tab (one concave corner), or stretch or
+      twist a pair of opposite sides -- keep the best few shapes per level,
+      return the best seen (good on stars, L-shapes, crosses, slanted
+      rooms...).
     """
 
     def build_enclosure(self) -> Construction | None:
@@ -479,9 +509,11 @@ class Player7(Player):
         return 0.0
 
     def _beam(self, starts, deadline):
-        """Level 0 is `starts`. Each level adds one tab (one more concave
-        corner) to every shape in the beam. Children are checked best-first by
-        estimated score plus an open-room bonus (see `_tab_moves`); of the valid
+        """Level 0 is `starts`. Each level makes one move on every shape in the
+        beam: add a tab (one more concave corner, see `_tab_moves`), or
+        stretch or twist a pair of opposite sides (see `_shift_moves`).
+        Children are checked best-first by estimated score plus an open-room
+        bonus (see `_tab_moves`); of the valid
         ones, the BEAM_WIDTH best by true score plus bonus survive, even when
         they score below their parent, so the search can pass through a worse
         intermediate shape and favours bumps with room to keep growing. Returns
@@ -494,10 +526,11 @@ class Player7(Player):
                 break
             children = {}
             for _score, verts, _construction in beam:
-                for est, bonus, new in self._tab_moves(verts, deadline):
-                    key = _canon(new)
-                    if key not in children or est + bonus > sum(children[key][:2]):
-                        children[key] = (est, bonus, new)
+                for moves in (self._tab_moves, self._shift_moves):
+                    for est, bonus, new in moves(verts, deadline):
+                        key = _canon(new)
+                        if key not in children or est + bonus > sum(children[key][:2]):
+                            children[key] = (est, bonus, new)
             valid, tried = [], 0
             for _est, bonus, new in sorted(
                 children.values(), key=lambda s: s[0] + s[1], reverse=True
@@ -781,6 +814,146 @@ class Player7(Player):
             else:
                 hi = mid - 1
         return asc[best]
+
+    def _shift_moves(self, verts, deadline):
+        """Stretch and twist moves on every pair of opposite sides: parallel,
+        running opposite ways round the (clean, CCW) loop, and joined by a
+        straight cut through the inside. The cut splits the shape in two and
+        one part moves (see `_shift`):
+
+        - stretch: along the sides, so both get longer (more pieces joined by
+          straight connectors) and the shape grows lengthwise;
+        - twist: at 45 degrees to them, so each side gets a diagonal jog (two
+          diagonal connectors per side, four in all) and the far part heads
+          off in a new direction, e.g. into a slanted hallway.
+
+        Each move goes as far as it fits and can be built. Yields (estimated
+        pre-gate score, open-room bonus (always 0 here), new outline), like
+        `_tab_moves`; the estimate is exact for area and perimeter."""
+        if not (STRETCH_MOVES or TWIST_MOVES):
+            return
+        A, C = self.weights.A, self.weights.C
+        poly_prep = prep(Polygon(verts))
+        n = len(verts)
+        edges = []
+        for k in range(n):
+            p, q = verts[k], verts[(k + 1) % n]
+            raw = math.hypot(q[0] - p[0], q[1] - p[1])
+            edges.append((p, (q[0] - p[0]) / raw, (q[1] - p[1]) / raw, round(raw)))
+        r = math.sqrt(0.5)
+
+        def cut_inside(i, s1, j, s2):
+            cut = LineString([_point_on(verts, i, s1), _point_on(verts, j, s2)])
+            return poly_prep.contains(cut)
+
+        def emit(i, s1, j, s2, unit, options):
+            """The deepest buildable shift by x * unit, x from `options`."""
+
+            def make(x):
+                return _shift(verts, i, s1, j, s2, (unit[0] * x, unit[1] * x))
+
+            found = self._deepest_shift(make, options)
+            if found is None:
+                return None
+            new, shape = found
+            if self._to_construction(new) is None:
+                return None
+            return (A * shape.area + C * shape.length, 0.0, new)
+
+        for i in range(n):
+            if time.process_time() > deadline:
+                return
+            p, ux, uy, li = edges[i]
+            for j in range(n):
+                pj, wx, wy, lj = edges[j]
+                if ux * wx + uy * wy > -1 + 1e-9:
+                    continue  # not running the opposite way
+                if (pj[0] - p[0]) * -uy + (pj[1] - p[1]) * ux <= 1e-9:
+                    continue  # edge j isn't across the inside from edge i
+                # where edge j sits along edge i's direction, measured from p;
+                # s units along edge i faces (top - s) units along edge j
+                top = (pj[0] - p[0]) * ux + (pj[1] - p[1]) * uy
+                lo, hi = max(0.0, top - lj), min(float(li), top)
+                if hi - lo < 1e-9:
+                    continue  # no straight cut across joins them
+
+                if STRETCH_MOVES:
+                    # where the cut goes doesn't change the result, as long as
+                    # it crosses the inside
+                    mid = (lo + hi) / 2
+                    deltas = [
+                        dl
+                        for dl in range(1, c.MAX_FACE_LENGTH + 1)
+                        if li + dl in self._faceable and lj + dl in self._faceable
+                    ]
+                    if deltas and cut_inside(i, mid, j, top - mid):
+                        move = emit(i, mid, j, top - mid, (ux, uy), deltas)
+                        if move is not None:
+                            yield move
+
+                if not TWIST_MOVES:
+                    continue
+                # each side splits into two faces (either may be empty) around
+                # its jog, so both cuts sit at buildable offsets
+                cuts_i = [s for s in self._split_offsets(li) if lo <= s <= hi]
+                if len(cuts_i) > TWIST_CUTS:
+                    step = (len(cuts_i) - 1) / (TWIST_CUTS - 1)
+                    cuts_i = [cuts_i[round(k * step)] for k in range(TWIST_CUTS)]
+                cuts_j = self._split_offsets(lj)
+                for s1 in cuts_i:
+                    # the buildable offsets on edge j nearest straight across
+                    across = top - s1
+                    below = [s for s in cuts_j if s <= across]
+                    above = [s for s in cuts_j if s > across]
+                    for s2 in below[-1:] + above[:1]:
+                        if not cut_inside(i, s1, j, s2):
+                            continue
+                        # edge i's direction turned 45 degrees either way
+                        for unit in (
+                            (r * (ux - uy), r * (ux + uy)),
+                            (r * (ux + uy), r * (uy - ux)),
+                        ):
+                            move = emit(i, s1, j, s2, unit, self._buildables)
+                            if move is not None:
+                                yield move
+
+    def _split_offsets(self, length):
+        """Offsets at which a side of this length can split into two buildable
+        faces (0 and `length` included: then one of the faces is empty)."""
+        return [
+            s
+            for s in range(length + 1)
+            if (s == 0 or s in self._faceable)
+            and (length - s == 0 or length - s in self._faceable)
+        ]
+
+    def _deepest_shift(self, make, options):
+        """For a stretch or twist, the outline `make(x)` for the largest x in
+        the ascending `options` that leaves a simple polygon inside the room,
+        with that polygon, or None. Like `_deepest_tab`, binary-searched, since
+        moving further mostly only gets harder."""
+
+        def fit(k):
+            new = _clean(make(options[k]))
+            if len(new) < 3:
+                return None
+            shape = Polygon(new)
+            if shape.is_valid and self._room_prep.contains(shape):
+                return new, shape
+            return None
+
+        best = fit(0)
+        if best is None:
+            return None
+        lo, hi = 1, len(options) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            found = fit(mid)
+            if found is not None:
+                best, lo = found, mid + 1
+            else:
+                hi = mid - 1
+        return best
 
     def _to_construction(self, verts):
         """Turn a vertex loop whose edges all run in multiples of 45 degrees from
