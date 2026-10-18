@@ -55,6 +55,7 @@ class FaceInventory:
         self._complete = True
         self._cache = {}
         self._prefix_cache = {}
+        self._return_cache = {}
         usage, pieces = [], []
         visits = 0
 
@@ -92,7 +93,16 @@ class FaceInventory:
         for options in self.options.values():
             options.sort(key=lambda option: (len(option.pieces), option.gates))
 
-    def _assign(self, lengths, minimum_gated, maximum_gated, deadline, node_limit):
+    def _assign(
+        self,
+        lengths,
+        minimum_gated,
+        maximum_gated,
+        deadline,
+        node_limit,
+        reserve_distance=0.0,
+        reserve_faces=0,
+    ):
         """Return (assignment, exhaustive); an exhausted budget is not a proof."""
         if time.process_time() >= deadline:
             return None, False
@@ -129,7 +139,23 @@ class FaceInventory:
             if gated > maximum_gated or suffix_straights[depth] > straights:
                 return False
             if depth == len(lengths):
-                return gated >= minimum_gated
+                if gated < minimum_gated:
+                    return False
+                if reserve_faces:
+                    # Test the stock left by this particular assignment, not
+                    # independently available lengths that could reuse stock.
+                    if sum(remaining) < reserve_faces:
+                        return False
+                    if (
+                        sum(p.length * n for (p, _), n in zip(self.types, remaining))
+                        < reserve_distance - TOL
+                    ):
+                        return False
+                    if not gated and not any(
+                        p.is_gate and n for (p, _), n in zip(self.types, remaining)
+                    ):
+                        return False
+                return True
             key = (depth, straights, min(gated, minimum_gated), tuple(remaining))
             if key in failures:
                 return False
@@ -179,6 +205,30 @@ class FaceInventory:
         answer = assignment is not None or not exhaustive
         if assignment is not None or exhaustive:
             self._prefix_cache[lengths] = answer
+        return answer
+
+    def can_reserve_return(self, lengths, distance, faces, deadline, node_limit=200):
+        """Can a joint prefix packing leave stock for a possible return?
+
+        Necessary conditions only: sufficient remaining length, pieces and a
+        gate. Geometry and exact lengths still require a validated closure.
+        An interrupted assignment is unknown, so it must not prune a branch.
+        """
+        key = (tuple(sorted(lengths)), float(distance), faces)
+        if key in self._return_cache:
+            return self._return_cache[key]
+        assignment, exhaustive = self._assign(
+            key[0],
+            0,
+            len(lengths),
+            deadline,
+            node_limit,
+            reserve_distance=distance,
+            reserve_faces=faces,
+        )
+        answer = assignment is not None or not exhaustive
+        if assignment is not None or exhaustive:
+            self._return_cache[key] = answer
         return answer
 
     def build(self, vertices, prefer_bonus=True, deadline=None):
