@@ -93,9 +93,9 @@ A scenario is a JSON file: `room` (polygon corners), `inventory`, `weights`.
 | `scenarios/l_shaped_room.json` | A non-convex L-shaped room with a scarcer inventory. |
 | `scenarios/limits_tight_room_favors_small_shape.json` | A tight room where only the smallest of many possible rectangles fits; it caught a real bug in the example player's shape ranking. |
 | `scenarios/invalid_examples.json` | The room and inventory the invalid-enclosure demo is built around (an L-shaped room, plus the odd pieces its examples need). |
-| `scenarios/B.json` | A 29-corner non-convex room (26 x 32) with 1000 of every wall length, one gate, and weights that reward area only. A stress test for placement. |
-| `scenarios/coms4444.json` | A very large non-convex room (176 corners, 236 x 41) with 1000 of every wall length. A stress test for speed. |
-| `scenarios/star.json` | A five-pointed-star room (10 corners) with 1000 of every wall length and no diagonal connectors. |
+| `scenarios/players/player1/B.json` | A 29-corner non-convex room (26 x 32) with 1000 of every wall length, one gate, and weights that reward area only. A stress test for placement. |
+| `scenarios/players/player1/coms4444.json` | A very large non-convex room (176 corners, 236 x 41) with 1000 of every wall length. A stress test for speed. |
+| `scenarios/players/player1/star.json` | A five-pointed-star room (10 corners) with 1000 of every wall length and no diagonal connectors. |
 | `scenarios/players/player1/` ... `player10/` | One folder per group for its own test scenarios. Each holds a `.gitkeep` so git keeps the empty folder. |
 
 ## `scripts/`
