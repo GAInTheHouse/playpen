@@ -17,13 +17,19 @@ class Player6(Player):
 
     GATE = 0
     WALL = 1
-    SEARCH_SECONDS = 45.0
-    DIAGONAL_SECONDS = 20.0
+    # CPU-time budget per method (the hard limit is 300 s for everything):
+    #   inscribed polygon solver   <= INSCRIBED_SECONDS (inside the orthogonal window)
+    #   orthogonal rect/L search   <= ORTHOGONAL_SECONDS in all, inscribed included
+    #   exact 45-degree beam search <= DIAGONAL_SECONDS
+    # Longer beam budgets were what improved scores in testing; extra time on
+    # the orthogonal side changed nothing.
+    ORTHOGONAL_SECONDS = 40.0
+    DIAGONAL_SECONDS = 150.0
     # Hard cap on the inscribed-polygon solver, which has no natural stopping
     # point (it tries up to 26 cell sizes, each with a shrink bisection).
     INSCRIBED_SECONDS = 25.0
     # Time spent turning that solution's staircases into diagonals.
-    INSCRIBED_DIAGONAL_SECONDS = 15.0
+    INSCRIBED_DIAGONAL_SECONDS = 5.0
     INSCRIBED_DIAGONALS = True
     STEPS = (
         (1, 0),
@@ -806,13 +812,10 @@ class Player6(Player):
 
         # Keep the supplied inventory unchanged, and return the best validated
         # construction before the submission checker's 60-second CPU limit.
-        overall_deadline = time.process_time() + self.SEARCH_SECONDS
+        t_start = self._t_start = time.process_time()
         has_diagonals = self.inventory.connectors.get(ConnectorType.DIAGONAL, 0) >= 2
-        self._deadline = (
-            overall_deadline - min(self.DIAGONAL_SECONDS, self.SEARCH_SECONDS)
-            if has_diagonals
-            else overall_deadline
-        )
+        self._deadline = t_start + self.ORTHOGONAL_SECONDS
+        self.phase_seconds = {}
         self._fit_cache = {}
         self.best_shape = None
         self.best_fit = None
@@ -823,7 +826,9 @@ class Player6(Player):
         if not self.inventory.has_gate():
             return None
         self.enumerate_faces()
+        t = time.process_time()
         self.full_checks()
+        self.phase_seconds["inscribed"] = time.process_time() - t
 
         if self.best_shape:
             best_area = self.best_shape.to_polygon().area
@@ -832,22 +837,26 @@ class Player6(Player):
             # Check how good our best shape is. If we think the solution is better than what we would get using beam search, then just return as is.
             # For now, if we cover the entire polygon or on large rooms, we cover more than half.
             if area_ratio >= 0.999 or (total_area > 10000 and area_ratio >= 0.5):
+                self._report_phases()
                 return self.best_construction
 
+        t = time.process_time()
         self.generate_quads()
         self.generate_quad_shapes()
+        self.phase_seconds["orthogonal"] = time.process_time() - t
 
         # Keep the rectangle/L result as a fallback. Spend only the reserved
         # time on the other branch's exact 45-degree beam search.
-        seconds_left = overall_deadline - time.process_time()
-        if has_diagonals and seconds_left > 0:
+        if has_diagonals:
+            t = time.process_time()
             diagonal = DiagonalSearch(
                 self.room,
                 self.inventory,
                 self.weights,
-                time_budget=min(self.DIAGONAL_SECONDS, seconds_left),
+                time_budget=self.DIAGONAL_SECONDS,
                 face_library=self.possible_faces or None,
             ).build_enclosure()
+            self.phase_seconds["diagonal beam"] = time.process_time() - t
             if diagonal is not None:
                 result = validate_construction(diagonal, self.room, self.inventory)
                 if result.valid:
@@ -856,4 +865,11 @@ class Player6(Player):
                         self.best_score = score
                         self.best_construction = diagonal
 
+        self._report_phases()
         return self.best_construction
+
+    def _report_phases(self):
+        """One line in the GUI/console: where the CPU time went."""
+        parts = ", ".join(f"{k} {v:.0f}s" for k, v in self.phase_seconds.items())
+        total = time.process_time() - self._t_start
+        self.note = f"CPU {total:.0f}s ({parts})"
