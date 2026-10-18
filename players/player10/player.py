@@ -1,6 +1,9 @@
 import heapq
 import time
 
+from itertools import islice
+from players.player10.polish import Polisher
+
 import src.constants as c
 from players.player0 import Player
 from players.player10.assign import Assigner, Assignment
@@ -22,6 +25,7 @@ from players.player10.shapes import (
 )
 from src.enclosure import Construction, score_construction, validate_construction
 from src.pieces import Connector, ConnectorType, Piece, PieceType
+from players.player10.freeform import free_shapes
 
 # CPU seconds the search may use. Nothing can interrupt a player on Windows, so
 # the player has to stop itself well inside the simulator's limit.
@@ -34,6 +38,9 @@ FALLBACK_BUDGET = 3.0
 FALLBACK_SHAPES = 40
 RECENT_FAILURES = 400
 SHRINK_STEPS = 4
+FREE_BUDGET = 40.0
+POLISH_BUDGET = 20.0  # CPU seconds for the polish pass
+POLISH_TRIES = 300  # candidates tried per round before giving up
 
 Candidate = tuple[float, str, tuple[int, ...]]
 
@@ -45,6 +52,9 @@ class Player10(Player):
     def build_enclosure(self) -> Construction | None:
         self._best: Construction | None = None
         self._best_score = 0.0  # a valid enclosure can score below 0; None is 0
+        self._best_shape: Shape | None = None
+        self._best_start: tuple[float, float] = (0.0, 0.0)
+        self._best_heading = 0.0
         try:
             self._build()
         except Exception as e:  # noqa: BLE001 -- a crash would end the whole run
@@ -82,6 +92,14 @@ class Player10(Player):
             if wanted:
                 self._deadline = started + TIME_BUDGET * share
                 self._search([x for f in wanted for x in self._candidates(f, bonus)])
+
+        # last: free-form polygons, which only have to beat the best family shape
+        self._deadline = time.process_time() + FREE_BUDGET #started + TIME_BUDGET
+        self._freeform(bonus)
+
+        self._deadline = time.process_time() + POLISH_BUDGET
+        self._polish(bonus)
+
         if self._best is None and not self.note:
             self.note = "nothing the inventory can build fits and scores above 0"
 
@@ -219,17 +237,89 @@ class Player10(Player):
     def _try(self, shape: Shape, assignment: Assignment) -> bool:
         """Place the shape; keep it if it is valid and beats the best so far."""
         for start, heading in self._placements(shape):
-            construction = self._construction(shape, assignment, start, heading)
-            # the simulator's own judge: only what it accepts is ever returned
-            result = validate_construction(construction, self.room, self.inventory)
-            if not result.valid:
-                continue
-            score = score_construction(result, self.weights)
-            if score > self._best_score:
-                self._best, self._best_score = construction, score
-                self.note = f"{shape.describe()}, score {score:.1f}"
-            return True
+            if self._try_fixed(shape, assignment, start, heading):
+                return True
         return False
+
+    def _try_fixed(
+        self,
+        shape: Shape,
+        assignment: Assignment,
+        start: tuple[float, float],
+        heading: float,
+    ) -> bool:
+        """Build at a known start and heading; True if the simulator accepts it."""
+        construction = self._construction(shape, assignment, start, heading)
+        # the simulator's own judge: only what it accepts is ever returned
+        result = validate_construction(construction, self.room, self.inventory)
+        if not result.valid:
+            return False
+        score = score_construction(result, self.weights)
+        if score > self._best_score:
+            self._best, self._best_score = construction, score
+            self._best_shape, self._best_start, self._best_heading = (
+                shape, start, heading,
+            )
+            self.note = f"{shape.describe()}, score {score:.1f}"
+        return True
+
+    def _freeform(self, bonus: float) -> None:
+        """Free-form polygons from the beam search, best-ranked first."""
+        closed = outscored = unassignable = rejected = 0
+        for shape, start, heading in free_shapes(
+            self._search_room,
+            self._assigner,
+            self.inventory,
+            self.weights,
+            self._deadline,
+        ):
+            closed += 1
+            # the most it could score; skip anything already beaten
+            if self._score(shape.area, shape.perimeter) + bonus <= self._best_score:
+                outscored += 1
+                continue
+            assignment = self._assigner.assign(shape.faces)
+            if assignment is None:
+                unassignable += 1
+            elif not self._try_fixed(shape, assignment, start, heading):
+                rejected += 1
+
+        stats = (
+            f"free: {closed} closed, {outscored} outscored, "
+            f"{unassignable} unassignable, {rejected} rejected"
+        )
+        self.note = f"{self.note} [{stats}]" if self.note else stats
+
+    def _polish(self, bonus: float) -> None:
+        """Grow and trim the best shape by adding or cutting rectangles, keeping
+        each change the simulator accepts that scores higher, until none does."""
+        if self._best_shape is None:
+            return
+        polisher = Polisher(
+            self._search_room.region,
+            self._assigner,
+            self.inventory,
+            lambda area, perimeter: self._score(area, perimeter) + bonus,
+        )
+        while time.process_time() < self._deadline:
+            before = self._best_score
+            for shape, start, heading in islice(
+                polisher.neighbours(
+                    self._best_shape,
+                    self._best_start,
+                    self._best_heading,
+                    before,
+                    self._deadline,
+                ),
+                POLISH_TRIES,
+            ):
+                assignment = self._assigner.assign(shape.faces)
+                if assignment is not None:
+                    self._try_fixed(shape, assignment, start, heading)
+                if self._best_score > before:
+                    break
+            if self._best_score <= before:
+                return
 
     def _placements(self, shape: Shape, limit: int = 3) -> list:
         return self._search_room.place(
