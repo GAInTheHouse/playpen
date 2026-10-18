@@ -642,6 +642,7 @@ class Player6(Player):
         solved, plan, why = solve_with_stock(
             self.room.polygon,
             combined_inventory,
+            cells=tuple(range(5,31)),
             must_use=list(self.inventory.gates.keys()),
             angle_stock=self.inventory.connectors,
         )
