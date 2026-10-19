@@ -76,22 +76,10 @@ class FaceCatalog:
         self, remaining: tuple[int, ...], length: int, with_gate: bool
     ) -> FaceOption | None:
         """The preferred face of this length the remaining stock can still build."""
-        return next(iter(self.options(remaining, length, with_gate)), None)
-
-    def options(
-        self, remaining: tuple[int, ...], length: int, with_gate: bool
-    ) -> tuple[FaceOption, ...]:
-        """All currently buildable alternatives for a face.
-
-        Options with the same length can consume very different pieces. The
-        search needs to retain those alternatives because preserving a scarce
-        piece can determine whether the rest of a loop is completable.
-        """
-        return tuple(
-            option
-            for option in self._options.get((length, with_gate), ())
-            if all(remaining[i] >= n for i, n in option.uses)
-        )
+        for option in self._options.get((length, with_gate), ()):
+            if all(remaining[i] >= n for i, n in option.uses):
+                return option
+        return None
 
     def total_length(self, remaining: tuple[int, ...]) -> int:
         return sum(k.length * n for k, n in zip(self.kinds, remaining))

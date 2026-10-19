@@ -34,8 +34,6 @@ MIN_TOTAL_TURN = -4
 MAX_TOTAL_TURN = 10
 EPS = 1e-7
 CLOSED_KEPT = 12
-FACE_OPTIONS_KEPT = 2
-RESOURCE_VARIANTS_KEPT = 2
 
 
 class Anchor:
@@ -205,32 +203,12 @@ class BeamSearch:
         return sorted(self.closed, key=lambda c: c.score, reverse=True)[:CLOSED_KEPT]
 
     def _select(self, children: list[State]) -> list[State]:
-        by_geometry: dict[tuple, list[State]] = {}
+        best: dict[tuple, State] = {}
         for child in children:
-            geometry = (
-                child.pos,
-                child.heading,
-                child.total_turn,
-                min(child.gate_faces, 2),
-            )
-            by_geometry.setdefault(geometry, []).append(child)
-
-        best = []
-        for states in by_geometry.values():
-            ranked = sorted(states, key=lambda s: s.estimate, reverse=True)
-            variants = []
-            resources = set()
-            for state in ranked:
-                resource_key = (state.remaining, state.connectors)
-                if resource_key in resources:
-                    continue
-                variants.append(state)
-                resources.add(resource_key)
-                if len(variants) == RESOURCE_VARIANTS_KEPT:
-                    break
-            best.extend(variants)
-
-        ranked = sorted(best, key=lambda s: s.estimate, reverse=True)
+            key = (child.pos, child.heading, child.total_turn, min(child.gate_faces, 2))
+            if key not in best or child.estimate > best[key].estimate:
+                best[key] = child
+        ranked = sorted(best.values(), key=lambda s: s.estimate, reverse=True)
         return ranked[: self.beam_width]
 
     def _expand(self, st: State) -> list[State]:
@@ -273,42 +251,42 @@ class BeamSearch:
             twice_area = st.twice_area + _cross(last, end)
             home = _home_distance(pos)
             for with_gate in (False, True):
-                for option in self.catalog.options(st.remaining, length, with_gate)[
-                    :FACE_OPTIONS_KEPT
-                ]:
-                    left = _spend(connectors, (), option.straights)
-                    if left is None:
-                        continue
-                    need = FULL_TURN - total
-                    if abs(need) > 2 * left[1] + left[2]:
-                        continue
-                    remaining = FaceCatalog.take(st.remaining, option)
-                    if self.catalog.total_length(remaining) < home - EPS:
-                        continue
-                    gate_faces = st.gate_faces + (1 if option.gates else 0)
-                    if gate_faces == 0 and not self.catalog.has_gate(remaining):
-                        continue
-                    chord = math.dist(end, start)
-                    estimate = (
-                        self.weights.A * (twice_area + _cross(end, start)) / 2
-                        + self.weights.C * (st.length + length + chord)
-                        + (self.weights.G if gate_faces >= 2 else 0.0)
+                option = self.catalog.pick(st.remaining, length, with_gate)
+                if option is None:
+                    continue
+                left = _spend(connectors, (), option.straights)
+                if left is None:
+                    continue
+                need = FULL_TURN - total
+                if abs(need) > 2 * left[1] + left[2]:
+                    continue
+                remaining = FaceCatalog.take(st.remaining, option)
+                if self.catalog.total_length(remaining) < home - EPS:
+                    continue
+                gate_faces = st.gate_faces + (1 if with_gate else 0)
+                if gate_faces == 0 and not self.catalog.has_gate(remaining):
+                    continue
+                chord = math.dist(end, start)
+                estimate = (
+                    self.weights.A * (twice_area + _cross(end, start)) / 2
+                    + self.weights.C * (st.length + length + chord)
+                    + (self.weights.G if gate_faces >= 2 else 0.0)
+                )
+                children.append(
+                    State(
+                        pos=pos,
+                        heading=heading,
+                        total_turn=total,
+                        remaining=remaining,
+                        connectors=left,
+                        faces=st.faces + (Face(heading, t, option),),
+                        points=st.points + (end,),
+                        twice_area=twice_area,
+                        length=st.length + length,
+                        gate_faces=gate_faces,
+                        estimate=estimate,
                     )
-                    children.append(
-                        State(
-                            pos=pos,
-                            heading=heading,
-                            total_turn=total,
-                            remaining=remaining,
-                            connectors=left,
-                            faces=st.faces + (Face(heading, t, option),),
-                            points=st.points + (end,),
-                            twice_area=twice_area,
-                            length=st.length + length,
-                            gate_faces=gate_faces,
-                            estimate=estimate,
-                        )
-                    )
+                )
         return children
 
     def _close(self, st: State) -> None:
@@ -360,33 +338,22 @@ class BeamSearch:
         first = st.faces[0]
         head = (Face(first.heading, closing_turn, first.option),) + st.faces[1:]
         for gates in product((False, True), repeat=len(legs)):
-
-            def add_completions(
-                index: int,
-                remaining: tuple[int, ...],
-                straights: int,
-                new_faces: list[Face],
-                gate_faces: int,
-                _gates=gates,
-            ) -> None:
-                if index < len(legs):
-                    t, heading, length = legs[index]
-                    for option in self.catalog.options(
-                        remaining, length, _gates[index]
-                    )[:FACE_OPTIONS_KEPT]:
-                        add_completions(
-                            index + 1,
-                            FaceCatalog.take(remaining, option),
-                            straights + option.straights,
-                            new_faces + [Face(heading, t, option)],
-                            gate_faces + (1 if option.gates else 0),
-                        )
-                    return
-
-                if gate_faces == 0:
-                    return
+            gate_faces = st.gate_faces + sum(gates)
+            if gate_faces == 0:
+                continue
+            remaining = st.remaining
+            straights = 0
+            new_faces = []
+            for (t, heading, length), with_gate in zip(legs, gates):
+                option = self.catalog.pick(remaining, length, with_gate)
+                if option is None:
+                    break
+                remaining = FaceCatalog.take(remaining, option)
+                straights += option.straights
+                new_faces.append(Face(heading, t, option))
+            else:
                 if _spend(connectors, (), straights) is None:
-                    return
+                    continue
                 score = (
                     BASELINE_SCORE
                     + self.weights.A * area
@@ -394,5 +361,3 @@ class BeamSearch:
                     + (self.weights.G if gate_faces >= 2 else 0.0)
                 )
                 self.closed.append(Closed(score, head + tuple(new_faces)))
-
-            add_completions(0, st.remaining, 0, [], st.gate_faces)
