@@ -134,14 +134,10 @@ class Player6RegressionTests(unittest.TestCase):
         )
         # Ring order is not used to recover the construction's first piece.
         reordered = Polygon(list(placed.exterior.coords)[:-1][::-1])
-        with (
-            patch.object(player, "find_candidates", return_value=[shape]),
-            patch(
-                "players.player6.player.find_fit",
-                return_value=(reordered, (theta, tx, ty)),
-            ),
-        ):
-            construction = player.build_enclosure()
+        player.best_score = 0
+        player.best_construction = None
+        player._consider_shape(shape, (reordered, (theta, tx, ty)))
+        construction = player.best_construction
         self.assertIsNotNone(construction)
         self.assertAlmostEqual(construction.start_heading, theta)
         self.assertEqual(construction.start, (tx, ty))
@@ -166,14 +162,11 @@ class Player6RegressionTests(unittest.TestCase):
             walls={5: 3}, gates={5: 2}, connectors={ConnectorType.RIGHT: 4}
         )
         player = Player6(self.room, inventory, self.weights)
-        with (
-            patch.object(player, "find_candidates", return_value=[one_gate, two_gates]),
-            patch(
-                "players.player6.player.find_fit",
-                side_effect=lambda q, p: (p, (0, 0, 0)),
-            ),
-        ):
-            construction = player.build_enclosure()
+        player.best_score = 0
+        player.best_construction = None
+        for shape in (one_gate, two_gates):
+            player._consider_shape(shape, (shape.to_polygon(), (0, 0, 0)))
+        construction = player.best_construction
         result = validate_construction(construction, self.room, inventory)
         self.assertTrue(result.valid, result.reason)
         self.assertTrue(result.second_gate_bonus)
@@ -181,14 +174,10 @@ class Player6RegressionTests(unittest.TestCase):
     def test_invalid_placement_is_not_returned(self):
         shape = make_shape([[(Player6.GATE, 5)]] + [[(Player6.WALL, 5)]] * 3, [90] * 4)
         player = Player6(self.room, inventory_for(shape), self.weights)
-        with (
-            patch.object(player, "find_candidates", return_value=[shape]),
-            patch(
-                "players.player6.player.find_fit",
-                return_value=(shape.to_polygon(), (0, 1000, 1000)),
-            ),
-        ):
-            self.assertIsNone(player.build_enclosure())
+        player.best_score = 0
+        player.best_construction = None
+        player._consider_shape(shape, (shape.to_polygon(), (0, 1000, 1000)))
+        self.assertIsNone(player.best_construction)
 
 
 class IterativeFitRegressionTests(unittest.TestCase):

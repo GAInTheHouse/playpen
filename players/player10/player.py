@@ -50,6 +50,7 @@ RECTANGLE_SHARE = 0.10
 L_SHARE = 0.20
 OCTAGON_SHARE = 0.32
 U_SHARE = 0.42
+SEGMENTED_SHARE = 0.50
 # Filling the room with grid cells (raster.py): the cell sides tried, and the most
 # time it may take. Only sides whose every multiple up to the face limit can be
 # built are used, paired so that one-cell steps use the most plentiful pieces.
@@ -57,9 +58,22 @@ RASTER_SIZES = (5, 6, 7, 8, 9, 10, 12, 15)
 RASTER_PAIRS = 24
 RASTER_SHARE = 0.1  # of the whole budget, at most
 RASTER_MAX_FACES = 900  # piece assignment walks the faces one level deep each
+# Large, highly articulated rooms with abundant stock benefit from comparing all
+# useful grid sizes and room-derived orientations.  This remains conditional so
+# ordinary scenarios retain the short raster pass.
+DENSE_RASTER_SECONDS = 80.0
+DENSE_RASTER_MIN_VERTICES = 32
+DENSE_RASTER_MIN_RIGHTS = 128
+SMALL_STOCK_MAX_PIECES = 20
+SMALL_STOCK_MAX_LENGTH = 180
+SMALL_STOCK_WIDTHS = (500, 2000, 8000, 24000)
 # Loops walked along the walls (beam.py): few win outright, but the shapes they find
 # are starting points for growing that the shape families would never give.
 BEAM_SECONDS = 8.0
+# Growing runs in two parts. The first ends here; then, where the best so far
+# leaves a large gap, a deeper walk along the walls gets its turn (small stocks,
+# or rooms barely filled), and growing resumes from the best loop with what is left.
+FIRST_GROW_SHARE = 0.55
 GROW_SHARE = 0.96  # growing the best shapes found so far (freeform.py)
 # polishing the best rectilinear shape (polish.py) gets the rest
 # growing asks for pieces for thousands of loops, so each ask gets less effort
@@ -72,6 +86,11 @@ WALL_SEED_SIZES = 40
 GRID_SEEDS = 2  # grid outlines grown, besides the shapes
 RASTER_FIT_CORNERS = True  # drop cells until a grid outline fits the corner stock
 SPOTS_TRIED = 24
+BOUNDARY_WIDTHS = (160, 640, 1600)
+BOUNDARY_MAX_FACES = 40
+BOUNDARY_STARTS = 16
+SEGMENTED_NOTCH_LENGTHS = 6
+SEGMENTED_TRIPLES = 400
 FALLBACK_BUDGET = 3.0
 FALLBACK_SHAPES = 40
 RECENT_FAILURES = 400
@@ -79,6 +98,36 @@ SHRINK_STEPS = 4
 POLISH_TRIES = 300  # candidates tried per round before giving up
 
 Candidate = tuple[float, str, tuple[int, ...]]
+
+
+def segmented_rectangle(a: int, middle: int, b: int, d: int, h: int) -> Shape:
+    """A long rectangle with mirrored diagonal bays in its horizontal edges."""
+    headed = (
+        (0, a),
+        (1, d),
+        (0, middle),
+        (7, d),
+        (0, b),
+        (2, h),
+        (4, b),
+        (5, d),
+        (4, middle),
+        (3, d),
+        (4, a),
+        (6, h),
+    )
+    draft = free_shape(headed)
+    horizontal = a + middle + b
+    area = (horizontal + math.sqrt(2.0) * d) * h - math.sqrt(2.0) * middle * d - d * d
+    perimeter = 2.0 * (horizontal + h + 2 * d)
+    return Shape(
+        draft.family,
+        draft.params,
+        draft.faces,
+        draft.turns,
+        area,
+        perimeter,
+    )
 
 
 class Player10(Player):
@@ -113,6 +162,8 @@ class Player10(Player):
         self._rectangle: tuple | None = None
         bonus = weights.G if len(self._assigner.targets) == 2 else 0.0
         self._bonus = bonus
+        dense_raster = self._dense_raster_worthwhile()
+        self._grow_max_faces = RASTER_MAX_FACES if dense_raster else MAX_FACES
         stock = self.inventory.connectors
         families = [
             family
@@ -135,6 +186,9 @@ class Player10(Player):
                 self._deadline = started + TIME_BUDGET * share
                 self._search([x for f in wanted for x in self._candidates(f, bonus)])
 
+        self._deadline = started + TIME_BUDGET * SEGMENTED_SHARE
+        self._segmented_rectangles(bonus)
+
         self._raster(
             min(
                 started + TIME_BUDGET * GROW_SHARE,
@@ -142,12 +196,34 @@ class Player10(Player):
             )
         )
 
+        if dense_raster:
+            self._raster(
+                min(
+                    started + TIME_BUDGET * 0.58,
+                    time.process_time() + DENSE_RASTER_SECONDS,
+                ),
+                headings=self._search_room.base_headings(90),
+                pair_limit=None,
+            )
+
         # loops walked along the walls: they only have to beat the best shape so
         # far, and every one that is valid also seeds growing
         self._deadline = time.process_time() + BEAM_SECONDS
         self._freeform(bonus)
 
-        self._grow(started + TIME_BUDGET * GROW_SHARE)
+        self._grow(started + TIME_BUDGET * FIRST_GROW_SHARE)
+
+        # a deeper walk along the walls where the best so far leaves a large gap
+        extra_end = started + TIME_BUDGET * GROW_SHARE
+        if not dense_raster and self._small_stock_search_worthwhile():
+            self._small_stock_boundary(
+                extra_end, widths=SMALL_STOCK_WIDTHS, diverse_beam=True
+            )
+        elif not dense_raster and self._should_explore():
+            self._extended_boundary(extra_end)
+
+        # the rest of the time grows again, from the best loop found so far
+        self._grow(started + TIME_BUDGET * GROW_SHARE, from_best=True)
 
         self._deadline = started + TIME_BUDGET
         self._polish(bonus)
@@ -157,9 +233,10 @@ class Player10(Player):
 
     # ------------------------------------------------------------------ grow
 
-    def _grow(self, deadline: float) -> None:
-        """Grow the shapes found so far into free-form loops (see freeform.py)."""
-        if not self._seeds:
+    def _grow(self, deadline: float, from_best: bool = False) -> None:
+        """Grow the shapes found so far into free-form loops (see freeform.py).
+        With `from_best`, the best loop found so far leads the seeds."""
+        if not self._seeds or time.process_time() >= deadline:
             return
         stock = self.inventory.connectors
         grower = Grower(
@@ -172,6 +249,7 @@ class Player10(Player):
             score=lambda area, perimeter: self._score(area, perimeter) + self._bonus,
             accept=self._accept_loop,
             can_build=lambda lengths: self._assigner.assign(lengths) is not None,
+            max_faces=self._grow_max_faces,
         )
         self._assigner.max_nodes = GROW_ASSIGN_NODES
         seeds = sorted(self._seeds, key=lambda loop: -loop.score)[:MAX_SEEDS]
@@ -180,6 +258,14 @@ class Player10(Player):
         seeds += sorted(self._grid_seeds, key=lambda loop: -loop.score)[:GRID_SEEDS]
         seeds += self._other_spots()
         seeds += self._along_walls()
+        if from_best and self._best_shape is not None:
+            best = Loop(
+                self._best_start,
+                self._best_heading,
+                headed_faces(self._best_shape),
+                self._best_score,
+            )
+            seeds.insert(0, best)
         # the charge for a side over the limit starts below what a unit of
         # growth earns, so spreading out comes first and repairs second
         grower.grow(seeds, deadline, first_charge=max(self.weights.A, 0.1))
@@ -225,6 +311,138 @@ class Player10(Player):
                     break
         return seeds
 
+    def _should_explore(self) -> bool:
+        """Whether a valid result still leaves a credible large score gap.
+
+        The isoperimetric bound is intentionally optimistic.  It is used only to
+        decide whether more search is worthwhile; final selection still uses the
+        official score. Requiring unused perimeter and enough corner connectors
+        avoids spending two extra minutes on stock-limited rooms.
+        """
+        if self._best_shape is None or self.weights.A <= 0:
+            return False
+        area = self._best_shape.area
+        perimeter = self._best_shape.perimeter
+        if self._assigner.total_length <= 0:
+            return False
+        corners_available = sum(
+            self.inventory.connectors.get(kind, 0)
+            for kind in (ConnectorType.RIGHT, ConnectorType.DIAGONAL)
+        )
+        # A wide search needs enough corners to express a materially more complex
+        # outline. With fewer than 32, the 40-face global walk cannot realize its
+        # intended complexity and empirical hard cases are connector-limited.
+        if corners_available < 32 or perimeter >= 0.85 * self._assigner.total_length:
+            return False
+        area_bound = min(
+            self._search_room.area,
+            self._assigner.total_length**2 / (4.0 * math.pi),
+        )
+        if area >= 0.40 * area_bound:
+            return False
+        optimistic = (
+            c.BASELINE_SCORE
+            + self.weights.A * area_bound
+            + self.weights.C * perimeter
+            + self._bonus
+        )
+        required_gain = max(100.0, 0.10 * max(self._best_score, 1.0))
+        return optimistic >= self._best_score + required_gain
+
+    def _dense_raster_worthwhile(self) -> bool:
+        """Whether a broader raster sweep can express the room and be supplied.
+
+        A large boundary needs hundreds of corners and at least roughly its own
+        perimeter in material.  Testing these structural conditions avoids a
+        scenario-name special case and prevents the extended pass from slowing
+        ordinary inventories.
+        """
+        vertices = len(self.room.get_boundary_points())
+        rights = self.inventory.connectors.get(ConnectorType.RIGHT, 0)
+        return (
+            vertices >= DENSE_RASTER_MIN_VERTICES
+            and rights >= DENSE_RASTER_MIN_RIGHTS
+            and self._assigner.total_length >= self.room.polygon.length
+        )
+
+    def _small_stock_search_worthwhile(self) -> bool:
+        """Whether exact stock pruning makes a deeper geometric beam worthwhile."""
+        if self._best_shape is None or self.weights.A <= 0:
+            return False
+        piece_count = sum(self._assigner.stock.values())
+        corner_count = sum(
+            self.inventory.connectors.get(kind, 0)
+            for kind in (ConnectorType.RIGHT, ConnectorType.DIAGONAL)
+        )
+        if (
+            piece_count > SMALL_STOCK_MAX_PIECES
+            or self._assigner.total_length > SMALL_STOCK_MAX_LENGTH
+            or len(self.room.get_boundary_points()) < 12
+            or corner_count < 8
+            or self._best_shape.perimeter < 0.75 * self._assigner.total_length
+        ):
+            return False
+        area_bound = min(
+            self._search_room.area,
+            self._assigner.total_length**2 / (4.0 * math.pi),
+        )
+        return self._best_shape.area < 0.80 * area_bound
+
+    def _small_stock_boundary(
+        self,
+        deadline: float,
+        *,
+        widths=SMALL_STOCK_WIDTHS,
+        diverse_starts=False,
+        diverse_beam=False,
+    ) -> None:
+        """Search complex small inventories after pruning infeasible face prefixes."""
+        corners_available = sum(
+            self.inventory.connectors.get(kind, 0)
+            for kind in (ConnectorType.RIGHT, ConnectorType.DIAGONAL)
+        )
+        max_faces = min(SMALL_STOCK_MAX_PIECES, corners_available)
+        for shape, start, heading in free_shapes(
+            self._search_room,
+            self._assigner,
+            self.inventory,
+            self.weights,
+            deadline,
+            widths=widths,
+            max_faces=max_faces,
+            diverse_starts=diverse_starts,
+            diverse_beam=diverse_beam,
+        ):
+            if (
+                self._score(shape.area, shape.perimeter) + self._bonus
+                <= self._best_score
+            ):
+                continue
+            assignment = self._assigner.assign(shape.faces)
+            if assignment is not None:
+                self._try_fixed(shape, assignment, start, heading)
+
+    def _extended_boundary(self, deadline: float) -> None:
+        """Search longer room-following loops from the most useful wall anchors."""
+        for shape, start, heading in free_shapes(
+            self._search_room,
+            self._assigner,
+            self.inventory,
+            self.weights,
+            deadline,
+            widths=BOUNDARY_WIDTHS,
+            max_faces=BOUNDARY_MAX_FACES,
+            max_starts=BOUNDARY_STARTS,
+        ):
+            if (
+                self._score(shape.area, shape.perimeter) + self._bonus
+                <= self._best_score
+            ):
+                continue
+            assignment = self._assigner.assign(shape.faces)
+            if assignment is not None:
+                self._try_fixed(shape, assignment, start, heading)
+
     def _other_spots(self) -> list[Loop]:
         """The best rectangle again, at other places it fits: a room with
         several open areas gets a seed growing in each."""
@@ -268,6 +486,18 @@ class Player10(Player):
         if not result.valid:
             return None
         score = score_construction(result, self.weights)
+        # ``free_shape`` carries topology but deliberately leaves area at zero.
+        # Retain the validator's exact geometry so later budget decisions compare
+        # the real incumbent against the room rather than treating every grown
+        # result as an empty polygon.
+        shape = Shape(
+            shape.family,
+            shape.params,
+            shape.faces,
+            shape.turns,
+            result.area,
+            result.perimeter,
+        )
         self._keep(construction, score, shape, start, first)
         return score
 
@@ -327,6 +557,72 @@ class Player10(Player):
 
     def _score(self, area: float, perimeter: float) -> float:
         return c.BASELINE_SCORE + self.weights.A * area + self.weights.C * perimeter
+
+    def _segmented_rectangles(self, bonus: float) -> None:
+        """Long rectangles whose mirrored diagonal bays split overlong edges.
+
+        With notch length ``d``, the two diagonal faces consume only
+        ``d / sqrt(2)`` of room depth.  This permits a nearly full-width enclosure
+        in a thin room while every individual linear face remains at most 30.
+        """
+        low_x, low_y, high_x, high_y = self.room.polygon.bounds
+        width, height = high_x - low_x, high_y - low_y
+        if min(width, height) <= 0 or max(width, height) / min(width, height) < 2.5:
+            return
+        if self._search_room.area < 0.75 * width * height:
+            return
+        stock = self.inventory.connectors
+        if (
+            stock.get(ConnectorType.RIGHT, 0) < 4
+            or stock.get(ConnectorType.DIAGONAL, 0) < 8
+        ):
+            return
+        lengths = self._assigner.lengths
+        triples = sorted(
+            (
+                (a + middle + b, a, middle, b)
+                for a in lengths
+                for middle in lengths
+                for b in lengths
+                if a >= b
+            ),
+            reverse=True,
+        )[:SEGMENTED_TRIPLES]
+        ranked = []
+        for d in lengths[:SEGMENTED_NOTCH_LENGTHS]:
+            for h in lengths:
+                if h <= math.sqrt(2.0) * d + c.TOL:
+                    continue
+                for horizontal, a, middle, b in triples:
+                    potential_area = (horizontal + math.sqrt(2.0) * d) * h - d * d
+                    if potential_area > self._search_room.area + c.TOL:
+                        continue
+                    area = (
+                        (horizontal + math.sqrt(2.0) * d) * h
+                        - math.sqrt(2.0) * middle * d
+                        - d * d
+                    )
+                    perimeter = 2.0 * (horizontal + h + 2 * d)
+                    # Rank a seed by the surrounding long rectangle: the grower
+                    # can push the recessed middle faces back outward.
+                    potential = self._score(potential_area, perimeter) + bonus
+                    if potential > self._best_score:
+                        exact = self._score(area, perimeter) + bonus
+                        ranked.append((potential, exact, a, middle, b, d, h))
+        ranked.sort(reverse=True)
+
+        for upper, _, a, middle, b, d, h in ranked:
+            if time.process_time() >= self._deadline or upper <= self._best_score:
+                return
+            shape = segmented_rectangle(a, middle, b, d, h)
+            assignment = self._assigner.assign(shape.faces)
+            if assignment is None:
+                continue
+            for start, heading in self._search_room.place(
+                shape.vertices(), 45, 180, limit=3
+            ):
+                if self._try_fixed(shape, assignment, start, heading):
+                    break
 
     # ---------------------------------------------------------------- search
 
@@ -442,9 +738,21 @@ class Player10(Player):
                 start,
                 heading,
             )
-            self.note = f"{shape.describe()}, score {score:.1f}"
+            right = sum(abs(turn) == 90 for turn in shape.turns)
+            diagonal = sum(abs(turn) == 45 for turn in shape.turns)
+            self.note = (
+                f"{shape.describe()}: score {score:.1f}, area {shape.area:.1f}, "
+                f"perimeter {shape.perimeter:.1f}, {len(construction.pieces)} pieces, "
+                f"corners {right}R/{diagonal}D"
+            )
 
-    def _raster(self, deadline: float) -> None:
+    def _raster(
+        self,
+        deadline: float,
+        *,
+        headings: list[float] | None = None,
+        pair_limit: int | None = RASTER_PAIRS,
+    ) -> None:
         """Outlines of the room filled with grid cells (see raster.py)."""
         lengths = set(self._assigner.lengths)
         top = int(c.MAX_FACE_LENGTH)
@@ -464,11 +772,15 @@ class Player10(Player):
         pairs = sorted(
             ((w, h) for w in sides for h in sides),
             key=lambda p: (-min(single[p[0]], single[p[1]]), p[0] * p[1]),
-        )[:RASTER_PAIRS]
+        )
+        if pair_limit is not None:
+            pairs = pairs[:pair_limit]
+        if headings is None:
+            headings = self._search_room.base_headings(90)[:2]
         for start, heading, faces in raster_loops(
             self._search_room.region,
             self.room.polygon,
-            self._search_room.base_headings(90)[:2],
+            headings,
             pairs,
             deadline,
             corner_budget=min(rights, RASTER_MAX_FACES) if RASTER_FIT_CORNERS else None,
@@ -489,7 +801,7 @@ class Player10(Player):
             score = self._accept_loop(start, heading, tuple(faces))
             # a grid outline small enough to grow is a starting point for growing:
             # it fills the room, and growing can add the diagonals it lacks
-            if score is not None and len(faces) <= MAX_FACES:
+            if score is not None and len(faces) <= self._grow_max_faces:
                 self._grid_seeds.append(Loop(start, heading, tuple(faces), score))
 
     def _freeform(self, bonus: float) -> None:

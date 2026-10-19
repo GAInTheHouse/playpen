@@ -43,7 +43,7 @@ def _rect(a, b, out, depth) -> Polygon:
 
 def _corners(poly: Polygon) -> list[tuple[int, int]]:
     """Integer corners of a counter-clockwise ring, collinear points removed."""
-    pts = [(int(round(x)), int(round(y))) for x, y in poly.exterior.coords[:-1]]
+    pts = [(round(x), round(y)) for x, y in poly.exterior.coords[:-1]]
     n = len(pts)
     keep = []
     for i in range(n):

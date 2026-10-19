@@ -53,6 +53,7 @@ class Assigner:
         self.lengths = sorted(self.compositions)
         self._choices = {n: len(a) + len(b) for n, (a, b) in self.compositions.items()}
         self._cache: dict[tuple[int, ...], tuple | None] = {}
+        self._supply_cache: dict[tuple[int, ...], bool] = {}
         self.max_nodes = MAX_SEARCH_NODES
 
     def _compose(self, keys, index, remaining, chosen, found):
@@ -106,6 +107,35 @@ class Assigner:
             ):
                 return chosen, sum(1 for f in chosen if any(k[0] for k in f))
         return None
+
+    def can_supply(self, faces: tuple[int, ...]) -> bool:
+        """Whether the stock can supply these partial faces, without requiring a gate.
+
+        This is a monotone feasibility filter for geometric search: an infeasible
+        prefix cannot become feasible after more faces are appended.  Gate placement
+        remains the responsibility of :meth:`assign` once a loop closes.
+        """
+        ordered = tuple(sorted(faces, key=lambda n: (self._choices.get(n, 0), -n)))
+        if ordered in self._supply_cache:
+            return self._supply_cache[ordered]
+        if sum(ordered) > self.total_length or any(
+            length not in self.compositions for length in ordered
+        ):
+            self._supply_cache[ordered] = False
+            return False
+        self._nodes = 0
+        self._failed = set()
+        possible = self._search(
+            ordered,
+            0,
+            dict(self.stock),
+            self.straights,
+            0,
+            0,
+            [],
+        )
+        self._supply_cache[ordered] = possible
+        return possible
 
     def _search(self, ordered, i, stock, straights, gate_faces, target, chosen) -> bool:
         if i == len(ordered):
