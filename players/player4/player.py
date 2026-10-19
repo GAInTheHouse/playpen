@@ -12,6 +12,7 @@ from players.player4.anchors_extra import (
     wall_heading_offset_anchors,
 )
 from players.player4.faces import FaceCatalog
+from players.player4.limits import search_limits
 from players.player4.search import Anchor, BeamSearch, Closed, connector_for
 from src.constants import TOL
 from src.enclosure import Construction, score_construction, validate_construction
@@ -38,7 +39,10 @@ class Player4(Player):
         if not self.inventory.has_gate():
             self.note = "No gates in the inventory -- no valid enclosure exists"
             return None
-        catalog = FaceCatalog(self.inventory)
+        limits = search_limits(self.inventory)
+        catalog = FaceCatalog(
+            self.inventory, max_pieces_per_face=limits["max_pieces_per_face"]
+        )
         if not catalog.lengths:
             self.note = "No piece is short enough to use"
             return None
@@ -55,6 +59,7 @@ class Player4(Player):
         budget_end = begin + SEARCH_SECONDS
         strategy = os.environ.get("PLAYER4_ANCHOR_STRATEGY", ANCHOR_STRATEGY)
         walls = room_anchors(self.room.polygon)
+        self._limits = limits
 
         if strategy == "interior_after":
             best, best_score = self._search_phases(
@@ -109,13 +114,14 @@ class Player4(Player):
                     best_score,
                 )
         elif strategy == "restart":
-            best, best_score = self._search_phases(
+            best, best_score, ranked = self._search_phases(
                 room,
                 catalog,
                 connectors,
                 walls,
                 budget_end,
                 BEAM_WIDTHS,
+                track_anchor_scores=True,
             )
             if best is not None and time.process_time() < budget_end:
                 restarts = anchors_from_construction(best)
@@ -125,6 +131,21 @@ class Player4(Player):
                     connectors,
                     restarts,
                     budget_end,
+                    (500,),
+                    best,
+                    best_score,
+                )
+            now = time.process_time()
+            if now < budget_end and ranked:
+                ranked.sort(key=lambda r: -r[1])
+                top = [walls[i] for i, _ in ranked[:TOP_WIDE_ANCHORS]]
+                slice_end = min(budget_end, now + (budget_end - now) * 0.2)
+                best, best_score = self._search_phases(
+                    room,
+                    catalog,
+                    connectors,
+                    top,
+                    slice_end,
                     (500,),
                     best,
                     best_score,
