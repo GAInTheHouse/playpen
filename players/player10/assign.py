@@ -51,7 +51,10 @@ class Assigner:
                     gated[:MAX_COMPOSITIONS],
                 )
         self.lengths = sorted(self.compositions)
+        self._choices = {n: len(a) + len(b) for n, (a, b) in self.compositions.items()}
         self._cache: dict[tuple[int, ...], tuple | None] = {}
+        self._supply_cache: dict[tuple[int, ...], bool] = {}
+        self.max_nodes = MAX_SEARCH_NODES
 
     def _compose(self, keys, index, remaining, chosen, found):
         if remaining == 0:
@@ -75,7 +78,9 @@ class Assigner:
     def assign(self, faces: tuple[int, ...]) -> Assignment | None:
         """Pieces for every face, with a gate on two different faces if that is
         wanted and possible, otherwise on one. None if the stock can't do it."""
-        ordered = tuple(sorted(faces, reverse=True))
+        # the faces with the fewest ways to be built go first, so the pieces
+        # only they can use are not taken by faces that had other choices
+        ordered = tuple(sorted(faces, key=lambda n: (self._choices.get(n, 0), -n)))
         if ordered not in self._cache:
             self._cache[ordered] = self._solve(ordered)
         solved = self._cache[ordered]
@@ -103,6 +108,35 @@ class Assigner:
                 return chosen, sum(1 for f in chosen if any(k[0] for k in f))
         return None
 
+    def can_supply(self, faces: tuple[int, ...]) -> bool:
+        """Whether the stock can supply these partial faces, without requiring a gate.
+
+        This is a monotone feasibility filter for geometric search: an infeasible
+        prefix cannot become feasible after more faces are appended.  Gate placement
+        remains the responsibility of :meth:`assign` once a loop closes.
+        """
+        ordered = tuple(sorted(faces, key=lambda n: (self._choices.get(n, 0), -n)))
+        if ordered in self._supply_cache:
+            return self._supply_cache[ordered]
+        if sum(ordered) > self.total_length or any(
+            length not in self.compositions for length in ordered
+        ):
+            self._supply_cache[ordered] = False
+            return False
+        self._nodes = 0
+        self._failed = set()
+        possible = self._search(
+            ordered,
+            0,
+            dict(self.stock),
+            self.straights,
+            0,
+            0,
+            [],
+        )
+        self._supply_cache[ordered] = possible
+        return possible
+
     def _search(self, ordered, i, stock, straights, gate_faces, target, chosen) -> bool:
         if i == len(ordered):
             return gate_faces >= target
@@ -112,7 +146,7 @@ class Assigner:
         if state in self._failed:
             return False
         self._nodes += 1
-        if self._nodes > MAX_SEARCH_NODES:
+        if self._nodes > self.max_nodes:
             return False
         plain, gated = self.compositions[ordered[i]]
         options = gated + plain if gate_faces < target else plain + gated
