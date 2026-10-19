@@ -69,13 +69,10 @@ class FaceCatalog:
                 )
                 options.setdefault((length, gates > 0), []).append(option)
 
-        sorted_opts = {
-            key: sorted(opts, key=lambda o: (len(o.pieces), o.gates))
+        self._options = {
+            key: sorted(opts, key=lambda o: (len(o.pieces), o.gates))[:ALTERNATIVES]
             for key, opts in options.items()
         }
-        self._all_options = sorted_opts
-        alt = ALTERNATIVES if sum(self.stock) < 80 else max(ALTERNATIVES, 24)
-        self._options = {key: opts[:alt] for key, opts in sorted_opts.items()}
         self.lengths = sorted({length for length, _ in self._options})
         self.length_set = set(self.lengths)
 
@@ -87,63 +84,6 @@ class FaceCatalog:
             if all(remaining[i] >= n for i, n in option.uses):
                 return option
         return None
-
-    def feasible(
-        self, remaining: tuple[int, ...], length: int, with_gate: bool
-    ) -> bool:
-        """Whether any composition of this length still fits the remaining stock."""
-        return any(
-            all(remaining[i] >= n for i, n in option.uses)
-            for option in self._all_options.get((length, with_gate), ())
-        )
-
-    def min_straights_for(self, length: int, with_gate: bool) -> int:
-        opts = self._all_options.get((length, with_gate), ())
-        if not opts:
-            return 10**9
-        return min(o.straights for o in opts)
-
-    def repack(
-        self,
-        stock: tuple[int, ...],
-        specs: list[tuple[int, bool]],
-        want_two_gate_faces: bool,
-    ) -> list[FaceOption] | None:
-        """Joint piece allocation across all faces (inspired by other groups'
-        allocate passes). Used when greedy `pick` cannot close the loop."""
-        ordered = sorted(
-            range(len(specs)),
-            key=lambda i: (-specs[i][0], specs[i][1]),
-        )
-        found: list[FaceOption | None] = [None] * len(specs)
-
-        def search(i: int, left: tuple[int, ...], gate_faces: int) -> bool:
-            if i == len(ordered):
-                if gate_faces == 0:
-                    return False
-                if want_two_gate_faces and gate_faces < 2:
-                    return False
-                return True
-            idx = ordered[i]
-            length, with_gate = specs[idx]
-            for option in self._all_options.get((length, with_gate), ()):
-                if not all(left[k] >= n for k, n in option.uses):
-                    continue
-                new_left = list(left)
-                for k, n in option.uses:
-                    new_left[k] -= n
-                found[idx] = option
-                if search(
-                    i + 1,
-                    tuple(new_left),
-                    gate_faces + (1 if option.gates else 0),
-                ):
-                    return True
-            return False
-
-        if not search(0, stock, 0):
-            return None
-        return [found[i] for i in range(len(specs))]
 
     def total_length(self, remaining: tuple[int, ...]) -> int:
         return sum(k.length * n for k, n in zip(self.kinds, remaining))
