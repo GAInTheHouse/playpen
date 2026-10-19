@@ -8,7 +8,6 @@ from shapely import union_all
 from shapely.affinity import rotate
 from shapely.geometry import Polygon, box
 from shapely.prepared import prep
-
 from src.constants import BASELINE_SCORE, TOL
 
 from .geometry import Budget, SearchStopped, Shape, boundary_shape, record, vertices

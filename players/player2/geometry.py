@@ -11,7 +11,6 @@ from shapely.affinity import rotate, translate
 from shapely.geometry import Polygon
 from shapely.geometry.polygon import orient
 from shapely.prepared import prep
-
 from src.constants import MAX_FACE_LENGTH, MIN_WALL_LENGTH, TOL
 from src.enclosure import Construction
 from src.pieces import Connector, ConnectorType
