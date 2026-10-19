@@ -10,7 +10,7 @@ import math
 import time
 from dataclasses import dataclass
 
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Point
 from shapely.prepared import prep
 
 from src.pieces import ConnectorType
@@ -58,6 +58,13 @@ def _turn(a, b):
     return (b - a + 4) % 8 - 4
 
 
+def tapered_width(width, depth, max_faces, compactness):
+    """Preserve early alternatives; trade breadth for depth gradually."""
+    fraction = min(1.0, max(0.0, (depth - 4) / max(1, max_faces - 5)))
+    target = max(4, round(width * (0.25 + 0.75 * compactness)))
+    return max(1, round(width + fraction * (target - width)))
+
+
 def face_beam(
     room,
     inventory,
@@ -69,6 +76,8 @@ def face_beam(
     beam_width=24,
     max_faces=14,
     starts=None,
+    boundary_guided=False,
+    compactness=1.0,
 ):
     """Search inside the room, checking exact one/two-face closures throughout.
 
@@ -83,9 +92,14 @@ def face_beam(
         "geometry_prunes": 0,
         "resource_prunes": 0,
         "bound_prunes": 0,
+        "return_prunes": 0,
+        "initial_states": 0,
+        "initial_lengths": 0,
+        "deepest": 0,
     }
     if not catalog.lengths or time.process_time() >= deadline:
         return stats
+    initial_lengths = set()
     lengths = tuple(sorted(catalog.lengths, reverse=True))
     length_set = set(lengths)
     right_max = inventory.connectors.get(ConnectorType.RIGHT, 0)
@@ -98,6 +112,7 @@ def face_beam(
     )
     polygon = room.polygon
     prepared = prep(polygon.buffer(1e-7))
+    prepared_boundary = prep(polygon.boundary.buffer(1e-7)) if boundary_guided else None
     minx, miny, maxx, maxy = polygon.bounds
     available_perimeter = catalog.max_perimeter
     incumbent = 0.0
@@ -139,12 +154,17 @@ def face_beam(
                 + max(0.0, weights.G)
             )
 
+        closure_best = None
+
         def record(vertices):
-            nonlocal incumbent
+            nonlocal incumbent, closure_best
             stats["closures"] += 1
             score = consider(vertices)
             if score is not None:
                 incumbent = max(incumbent, score)
+                closure_best = (
+                    score if closure_best is None else max(closure_best, score)
+                )
 
         def close(
             state, start=start, directions=directions, local_deadline=local_deadline
@@ -209,7 +229,13 @@ def face_beam(
         for length in lengths:
             dx, dy = directions[0]
             end = (start[0] + length * dx, start[1] + length * dy)
-            if inside_edge(start, end):
+            if inside_edge(start, end) and (
+                not boundary_guided
+                or prepared_boundary.covers(LineString((start, end)))
+            ):
+                stats["initial_states"] += 1
+                initial_lengths.add(length)
+                stats["initial_lengths"] = len(initial_lengths)
                 pts = (start, end)
                 cross_sum = _cross(start, end)
                 beam.append(
@@ -231,9 +257,11 @@ def face_beam(
             children = {}
             for state in beam:
                 stats["expanded"] += 1
+                stats["deepest"] = max(stats["deepest"], len(state.lengths))
                 if not catalog.feasible_prefix(state.lengths):
                     stats["resource_prunes"] += 1
                     continue
+                closure_best = None
                 if len(state.lengths) >= 2:
                     close(state)
                 if time.process_time() >= local_deadline:
@@ -286,6 +314,23 @@ def face_beam(
                         ):
                             stats["geometry_prunes"] += 1
                             continue
+                        prefix = state.lengths + (length,)
+                        if boundary_guided:
+                            return_faces = max(
+                                1,
+                                math.ceil((distance - 1e-7) / 30),
+                                math.ceil(abs(8 - total_turn) / 2) - 1,
+                            )
+                            if (
+                                len(prefix) + return_faces > max_faces
+                                or abs(8 - total_turn)
+                                > 2 * (right_max - r) + diagonal_max - d
+                                or not catalog.can_reserve_return(
+                                    prefix, distance, return_faces, local_deadline
+                                )
+                            ):
+                                stats["return_prunes"] += 1
+                                continue
                         pts = state.points + (b,)
                         cross_sum = state.cross_sum + _cross(a, b)
                         score = merit(pts, perimeter, cross_sum)
@@ -293,9 +338,24 @@ def face_beam(
                         # in projected area/perimeter utility. It is ranking,
                         # never an invalid claim that a partial loop is valid.
                         rank = score + 0.15 * (score - state.merit)
+                        if boundary_guided:
+                            midpoint = Point((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+                            contact = 1 / (1 + polygon.boundary.distance(midpoint))
+                            # Score drives the beam; contact is a small local
+                            # bonus, never a reward for endlessly tracing walls.
+                            rank += (
+                                0.02
+                                * contact
+                                * (
+                                    abs(weights.A) * length * length
+                                    + abs(weights.C) * length
+                                )
+                            )
+                            if closure_best is not None:
+                                rank += 0.1 * max(0.0, closure_best - score)
                         child = State(
                             pts,
-                            state.lengths + (length,),
+                            prefix,
                             heading,
                             total_turn,
                             r,
@@ -326,14 +386,21 @@ def face_beam(
             # Keep heading/position diversity so a single long-side family
             # does not consume every beam slot and suppress useful turns.
             ranked = sorted(children.values(), key=lambda item: item[0], reverse=True)
+            width = (
+                tapered_width(beam_width, _depth, max_faces, compactness)
+                if boundary_guided
+                else beam_width
+            )
             beam, buckets = [], {}
             for _rank, state in ranked:
                 end = state.points[-1]
                 bucket = (state.heading, round(end[0] / 8), round(end[1] / 8))
-                if buckets.get(bucket, 0) >= max(2, beam_width // 8):
+                if boundary_guided:
+                    bucket += (state.turn,)
+                if buckets.get(bucket, 0) >= max(2, width // 8):
                     continue
                 buckets[bucket] = buckets.get(bucket, 0) + 1
                 beam.append(state)
-                if len(beam) >= beam_width:
+                if len(beam) >= width:
                     break
     return stats
