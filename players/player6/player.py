@@ -34,7 +34,7 @@ class Player6(Player):
     INSCRIBED_SECONDS = 25.0
     # Time spent turning that solution's staircases into diagonals.
     INSCRIBED_DIAGONAL_SECONDS = 5.0
-    INSCRIBED_DIAGONALS = True
+    INSCRIBED_DIAGONALS = False  # staircase->diagonal pass: never improved a score
     STEPS = (
         (1, 0),
         (0, 1),
@@ -655,7 +655,7 @@ class Player6(Player):
             else:
                 combined_inventory[k] = v
 
-        solved, plan, why = solve_with_stock(
+        solved, plan, _why = solve_with_stock(
             self.room.polygon,
             combined_inventory,
             cells=tuple(range(5, 31)),
@@ -686,8 +686,8 @@ class Player6(Player):
 
         edges = []
         gates = clean_stock(self.inventory.gates.copy())
-        for l in lengths:
-            stock: list = plan[round(l)]
+        for ln in lengths:
+            stock: list = plan[round(ln)]
             sizes, inv = stock[0]
 
             edge_sizes = []
@@ -703,7 +703,7 @@ class Player6(Player):
             edges.append(
                 Player6.Edge(
                     edge_sizes,
-                    round(l),
+                    round(ln),
                     len(sizes) - 1,
                 )
             )

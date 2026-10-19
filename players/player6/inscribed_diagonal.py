@@ -69,7 +69,7 @@ def to_faces(coords, tol=1e-3):
         units = round(ang / 45.0)
         if abs(ang - 45.0 * units) > 0.5 or abs(units) != 2:
             return None
-        lengths.append(int(round(length)))
+        lengths.append(round(length))
         turns.append(units)
     alpha = math.degrees(math.atan2(pts[1][1] - pts[0][1], pts[1][0] - pts[0][0]))
     return lengths, turns, alpha

@@ -33,7 +33,7 @@ def _expired(deadline):
 
 # --------------------------------------------------------- piece assignment
 def clean_stock(stock):
-    return {int(l): int(c) for l, c in stock.items() if 5 <= l <= 30 and c > 0}
+    return {int(ln): int(c) for ln, c in stock.items() if 5 <= ln <= 30 and c > 0}
 
 
 def compositions(total, lengths):
@@ -45,10 +45,10 @@ def compositions(total, lengths):
         if rem == 0:
             out.append(tuple(cur))
             return
-        for l in lengths:
-            if l <= rem and l <= maxpart:
-                cur.append(l)
-                rec(rem - l, l, cur)
+        for ln in lengths:
+            if ln <= rem and ln <= maxpart:
+                cur.append(ln)
+                rec(rem - ln, ln, cur)
                 cur.pop()
 
     rec(total, max(lengths), [])
@@ -83,7 +83,10 @@ def _build(runs, stock, cls=(), prefer_few=False):
             )
         )
         comps.append(
-            [(c, tuple(c.count(l) for l in lens), any(p in cls for p in c)) for c in cs]
+            [
+                (c, tuple(c.count(ln) for ln in lens), any(p in cls for p in c))
+                for c in cs
+            ]
         )
     suffix_len = [0] * (len(need) + 1)
     suffix_runs = [0] * (len(need) + 1)
@@ -96,18 +99,18 @@ def _build(runs, stock, cls=(), prefer_few=False):
         has = any(h for _, _, h in comps[i])
         suffix_cls[i] = suffix_cls[i + 1] + (need[i][1] if has else 0)
         suffix_minp[i] = suffix_minp[i + 1] + need[i][1] * minp[i]
-    return dict(
-        lens=lens,
-        need=need,
-        comps=comps,
-        suffix_len=suffix_len,
-        suffix_runs=suffix_runs,
-        suffix_cls=suffix_cls,
-        stock=stock,
-        minp=minp,
-        suffix_minp=suffix_minp,
-        cls_idx=[j for j, l in enumerate(lens) if l in cls],
-    )
+    return {
+        "lens": lens,
+        "need": need,
+        "comps": comps,
+        "suffix_len": suffix_len,
+        "suffix_runs": suffix_runs,
+        "suffix_cls": suffix_cls,
+        "stock": stock,
+        "minp": minp,
+        "suffix_minp": suffix_minp,
+        "cls_idx": [j for j, ln in enumerate(lens) if ln in cls],
+    }
 
 
 def _dfs(ctx, k, node_limit, piece_cap=None):
@@ -118,7 +121,7 @@ def _dfs(ctx, k, node_limit, piece_cap=None):
     """
     lens, need, comps, stock = ctx["lens"], ctx["need"], ctx["comps"], ctx["stock"]
     cls_idx, suffix_cls = ctx["cls_idx"], ctx["suffix_cls"]
-    start = tuple(stock[l] for l in lens)
+    start = tuple(stock[ln] for ln in lens)
     total0 = sum(start)
     minp, suffix_minp = ctx["minp"], ctx["suffix_minp"]
     if k and suffix_cls[0] < k:
@@ -141,11 +144,14 @@ def _dfs(ctx, k, node_limit, piece_cap=None):
         done = need[ti][1] - left
         wall_left = ctx["suffix_len"][ti] - done * need[ti][0]
         runs_left = ctx["suffix_runs"][ti] - done
-        if wall_left > sum(l * c for l, c in zip(lens, stk)) or runs_left > sum(stk):
+        if wall_left > sum(ln * c for ln, c in zip(lens, stk)) or runs_left > sum(stk):
             return False
-        if piece_cap is not None:  # pieces so far + fewest still needed
-            if total0 - sum(stk) + left * minp[ti] + suffix_minp[ti + 1] > piece_cap:
-                return False
+        # pieces so far + fewest still needed
+        if (
+            piece_cap is not None
+            and total0 - sum(stk) + left * minp[ti] + suffix_minp[ti + 1] > piece_cap
+        ):
+            return False
         has_type = any(h for _, _, h in comps[ti])
         if k and cr < k:  # can enough class runs still happen?
             bound = min(
@@ -225,17 +231,17 @@ def class_usable(stock, must_use, copy_cap=64):
     cls = {p for p in (must_use or []) if p in stock}
     if not cls:
         return False
-    S = sum(l * min(c, copy_cap) for l, c in stock.items())
+    S = sum(ln * min(c, copy_cap) for ln, c in stock.items())
     off, full = S, (1 << (2 * S + 1)) - 1
     no_cls, with_cls = 1 << off, 0
-    for l, c in stock.items():
+    for ln, c in stock.items():
         for _ in range(min(c, copy_cap)):
 
-            def move(x):
-                return (x | (x << l) | (x >> l)) & full  # skip / side A / side B
+            def move(x, ln=ln):
+                return (x | (x << ln) | (x >> ln)) & full  # skip / side A / side B
 
-            if l in cls:
-                with_cls = move(with_cls) | ((no_cls << l) | (no_cls >> l)) & full
+            if ln in cls:
+                with_cls = move(with_cls) | ((no_cls << ln) | (no_cls >> ln)) & full
             else:
                 no_cls, with_cls = move(no_cls), move(with_cls)
     return bool((with_cls >> off) & 1)
@@ -273,7 +279,7 @@ def assign_pieces(runs, stock, must_use=None, node_limit=200_000, piece_cap=None
     if not stock:
         return None
     runs = [int(r) for r in runs]
-    if sum(runs) > sum(l * c for l, c in stock.items()):
+    if sum(runs) > sum(ln * c for ln, c in stock.items()):
         return None
     if len(runs) > sum(stock.values()):
         return None
@@ -560,7 +566,7 @@ def solve_with_stock(
 def diagnose_class(poly, stock, must_use, cells=(5, 10, 15), **kw):
     """Print which stage rejects (or accepts) the must-use class, and why."""
     cleaned = clean_stock(stock)
-    dropped = sorted(l for l, c in stock.items() if int(l) not in cleaned)
+    dropped = sorted(ln for ln, c in stock.items() if int(ln) not in cleaned)
     print(f"stock lengths ignored (outside 5..30 or count 0): {dropped or 'none'}")
     missing = [p for p in must_use if p not in cleaned]
     print(f"class lengths missing from usable stock: {missing or 'none'}")
