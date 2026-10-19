@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Stock-constrained extension of inscribed_polygon.py.
 
@@ -7,12 +8,13 @@ each piece >= 5. Needs only shapely and numpy.
 
 Strategy
   1. Geometry-first: run the normal solver, ask "can this boundary be built
-     from stock?" (tiny exact ILP). Underconstrained stock stops here.
+     from stock?" (bounded assignment search).
   2. Overconstrained: wall is the bottleneck, so also try
        a) the largest buildable rectangle (best when the budget is tiny)
        b) shrinking the input inward by d units (mitre buffer) and re-solving,
           bisecting for the smallest d whose boundary is buildable.
-  3. Return the largest buildable candidate plus the piece plan.
+  3. Publish buildable candidates immediately; a caller may validate and score
+     each one. Return the best-scoring candidate plus its piece plan.
 """
 
 from collections import Counter
@@ -27,22 +29,27 @@ import players.player6.inscribed_polygon as ip
 
 # --------------------------------------------------------- piece assignment
 def clean_stock(stock):
-    return {int(l): int(c) for l, c in stock.items() if 5 <= l <= 30 and c > 0}
+    return {
+        int(length): int(c)
+        for length, c in stock.items()
+        if 5 <= length <= 30 and c > 0
+    }
 
 
-def compositions(total, lengths):
+def compositions(total, lengths, stop=None):
     """All multisets of `lengths` (non-increasing tuples) summing to total."""
     lengths = sorted(lengths, reverse=True)
     out = []
 
     def rec(rem, maxpart, cur):
+        ip.check_stop(stop)
         if rem == 0:
             out.append(tuple(cur))
             return
-        for l in lengths:
-            if l <= rem and l <= maxpart:
-                cur.append(l)
-                rec(rem - l, l, cur)
+        for length in lengths:
+            if length <= rem and length <= maxpart:
+                cur.append(length)
+                rec(rem - length, length, cur)
                 cur.pop()
 
     rec(total, max(lengths), [])
@@ -54,7 +61,7 @@ def run_lengths(poly):
     return np.rint(ip.merged_edge_lengths(poly)).astype(int)
 
 
-def _build(runs, stock, cls=(), prefer_few=False):
+def _build(runs, stock, cls=(), prefer_few=False, stop=None):
     """Precompute compositions etc. `cls` = class piece lengths (may be empty).
     Returns ctx or None if some run length can't be built at all."""
     cls = set(cls)
@@ -62,7 +69,7 @@ def _build(runs, stock, cls=(), prefer_few=False):
     need = sorted(Counter(int(r) for r in runs).items())  # short runs first
     comps = []
     for L, _ in need:
-        cs = compositions(L, lens)
+        cs = compositions(L, lens, stop=stop)
         if not cs:
             return None
         # class compositions first (when a class is active), then plentiful
@@ -77,7 +84,10 @@ def _build(runs, stock, cls=(), prefer_few=False):
             )
         )
         comps.append(
-            [(c, tuple(c.count(l) for l in lens), any(p in cls for p in c)) for c in cs]
+            [
+                (c, tuple(c.count(length) for length in lens), any(p in cls for p in c))
+                for c in cs
+            ]
         )
     suffix_len = [0] * (len(need) + 1)
     suffix_runs = [0] * (len(need) + 1)
@@ -90,21 +100,21 @@ def _build(runs, stock, cls=(), prefer_few=False):
         has = any(h for _, _, h in comps[i])
         suffix_cls[i] = suffix_cls[i + 1] + (need[i][1] if has else 0)
         suffix_minp[i] = suffix_minp[i + 1] + need[i][1] * minp[i]
-    return dict(
-        lens=lens,
-        need=need,
-        comps=comps,
-        suffix_len=suffix_len,
-        suffix_runs=suffix_runs,
-        suffix_cls=suffix_cls,
-        stock=stock,
-        minp=minp,
-        suffix_minp=suffix_minp,
-        cls_idx=[j for j, l in enumerate(lens) if l in cls],
-    )
+    return {
+        "lens": lens,
+        "need": need,
+        "comps": comps,
+        "suffix_len": suffix_len,
+        "suffix_runs": suffix_runs,
+        "suffix_cls": suffix_cls,
+        "stock": stock,
+        "minp": minp,
+        "suffix_minp": suffix_minp,
+        "cls_idx": [j for j, length in enumerate(lens) if length in cls],
+    }
 
 
-def _dfs(ctx, k, node_limit, piece_cap=None):
+def _dfs(ctx, k, node_limit, piece_cap=None, stop=None):
     """
     Exact search: split every run into pieces from stock so that at least k
     RUNS contain a class piece (k = 0: no class requirement; two class pieces
@@ -112,9 +122,10 @@ def _dfs(ctx, k, node_limit, piece_cap=None):
     """
     lens, need, comps, stock = ctx["lens"], ctx["need"], ctx["comps"], ctx["stock"]
     cls_idx, suffix_cls = ctx["cls_idx"], ctx["suffix_cls"]
-    start = tuple(stock[l] for l in lens)
+    start = tuple(stock[length] for length in lens)
     total0 = sum(start)
     minp, suffix_minp = ctx["minp"], ctx["suffix_minp"]
+    piece_lengths = ctx.get("piece_lengths", lens)
     if k and suffix_cls[0] < k:
         return None
     if piece_cap is not None and suffix_minp[0] > piece_cap:
@@ -123,6 +134,7 @@ def _dfs(ctx, k, node_limit, piece_cap=None):
 
     def rec(ti, ki, left, stk, cr):
         nonlocal nodes
+        ip.check_stop(stop)
         if left == 0:  # type done
             if piece_cap is not None and total0 - sum(stk) > piece_cap:
                 return False
@@ -135,11 +147,16 @@ def _dfs(ctx, k, node_limit, piece_cap=None):
         done = need[ti][1] - left
         wall_left = ctx["suffix_len"][ti] - done * need[ti][0]
         runs_left = ctx["suffix_runs"][ti] - done
-        if wall_left > sum(l * c for l, c in zip(lens, stk)) or runs_left > sum(stk):
+        if wall_left > sum(
+            length * c for length, c in zip(piece_lengths, stk)
+        ) or runs_left > sum(stk):
             return False
-        if piece_cap is not None:  # pieces so far + fewest still needed
-            if total0 - sum(stk) + left * minp[ti] + suffix_minp[ti + 1] > piece_cap:
-                return False
+        # Pieces so far + fewest still needed.
+        if (
+            piece_cap is not None
+            and total0 - sum(stk) + left * minp[ti] + suffix_minp[ti + 1] > piece_cap
+        ):
+            return False
         has_type = any(h for _, _, h in comps[ti])
         if k and cr < k:  # can enough class runs still happen?
             bound = min(
@@ -185,6 +202,88 @@ def _dfs(ctx, k, node_limit, piece_cap=None):
     return plan
 
 
+def assign_inventory(
+    runs, walls, gates, angle_stock=None, *, stop=None, node_limit=200_000
+):
+    """Assign typed (0=gate, 1=wall) pieces, preferring two actual gate faces.
+
+    A one-gate feasible plan is retained if the optional bonus search times out.
+    Counts of equal-length walls and gates remain independent throughout DFS.
+    """
+    stock = {(1, length): n for length, n in clean_stock(walls).items()}
+    stock.update({(0, length): n for length, n in clean_stock(gates).items()})
+    if not any(kind == 0 for kind, _ in stock) or not len(runs):
+        return None
+    angles = clean_angle_stock(angle_stock)
+    if len(runs) > angles.get("right", len(runs)):
+        return None
+    cap = len(runs) + angles["straight"] if "straight" in angles else None
+    keys = sorted(stock)
+    need = sorted(Counter(int(r) for r in runs).items())
+    comps = []
+    max_pieces = min(6, angles.get("straight", 5) + 1)
+    for length, _ in need:
+        options = []
+
+        def rec(i, remaining, chosen, options):
+            ip.check_stop(stop)
+            if remaining == 0:
+                pieces = tuple(chosen)
+                options.append(
+                    (
+                        pieces,
+                        tuple(pieces.count(key) for key in keys),
+                        any(kind == 0 for kind, _ in pieces),
+                    )
+                )
+                return
+            if i == len(keys) or len(chosen) >= max_pieces:
+                return
+            key = keys[i]
+            most = min(stock[key], remaining // key[1], max_pieces - len(chosen))
+            for count in range(most + 1):
+                rec(i + 1, remaining - count * key[1], chosen + [key] * count, options)
+
+        rec(0, length, [], options)
+        if not options:
+            return None
+        options.sort(key=lambda c: (not c[2], sum(p[0] == 0 for p in c[0]), len(c[0])))
+        comps.append(options)
+    suffix_len = [0] * (len(need) + 1)
+    suffix_runs = [0] * (len(need) + 1)
+    suffix_cls = [0] * (len(need) + 1)
+    suffix_minp = [0] * (len(need) + 1)
+    minp = [min(len(pieces) for pieces, _, _ in options) for options in comps]
+    for i in range(len(need) - 1, -1, -1):
+        length, count = need[i]
+        suffix_len[i] = suffix_len[i + 1] + length * count
+        suffix_runs[i] = suffix_runs[i + 1] + count
+        suffix_cls[i] = suffix_cls[i + 1] + count * any(c[2] for c in comps[i])
+        suffix_minp[i] = suffix_minp[i + 1] + count * minp[i]
+    ctx = {
+        "lens": keys,
+        "piece_lengths": [key[1] for key in keys],
+        "need": need,
+        "comps": comps,
+        "stock": stock,
+        "minp": minp,
+        "suffix_len": suffix_len,
+        "suffix_runs": suffix_runs,
+        "suffix_cls": suffix_cls,
+        "suffix_minp": suffix_minp,
+        "cls_idx": [i for i, key in enumerate(keys) if key[0] == 0],
+    }
+    plan = _dfs(ctx, 1, node_limit, cap, stop=stop)
+    if plan is not None and sum(clean_stock(gates).values()) >= 2:
+        try:
+            bonus_plan = _dfs(ctx, 2, node_limit, cap, stop=stop)
+        except ip.SearchStopped:
+            return plan
+        if bonus_plan is not None:
+            return bonus_plan
+    return plan
+
+
 def plan_usage(plan):
     used = Counter()
     for items in plan.values():
@@ -207,7 +306,7 @@ def bonus_earned(plan, must_use):
 
 
 # ------------------------------------------------- must-use class: feasibility
-def class_usable(stock, must_use, copy_cap=64):
+def class_usable(stock, must_use, copy_cap=64, stop=None):
     """
     Geometry-independent NECESSARY test for using a class piece.
     A closed rectilinear polygon has rightward wall == leftward wall (and
@@ -219,23 +318,28 @@ def class_usable(stock, must_use, copy_cap=64):
     cls = {p for p in (must_use or []) if p in stock}
     if not cls:
         return False
-    S = sum(l * min(c, copy_cap) for l, c in stock.items())
+    S = sum(length * min(c, copy_cap) for length, c in stock.items())
     off, full = S, (1 << (2 * S + 1)) - 1
     no_cls, with_cls = 1 << off, 0
-    for l, c in stock.items():
+    for length, c in stock.items():
         for _ in range(min(c, copy_cap)):
+            ip.check_stop(stop)
 
-            def move(x):
-                return (x | (x << l) | (x >> l)) & full  # skip / side A / side B
+            def move(x, length=length):
+                return (
+                    x | (x << length) | (x >> length)
+                ) & full  # skip / side A / side B
 
-            if l in cls:
-                with_cls = move(with_cls) | ((no_cls << l) | (no_cls >> l)) & full
+            if length in cls:
+                with_cls = (
+                    move(with_cls) | ((no_cls << length) | (no_cls >> length)) & full
+                )
             else:
                 no_cls, with_cls = move(no_cls), move(with_cls)
     return bool((with_cls >> off) & 1)
 
 
-def class_fits_in_run(stock, must_use, cell):
+def class_fits_in_run(stock, must_use, cell, stop=None):
     """Can a class piece sit inside a run whose total is a multiple of `cell`
     (so the shape needs NO wall shifting and loses no area)?"""
     stock = clean_stock(stock)
@@ -244,14 +348,16 @@ def class_fits_in_run(stock, must_use, cell):
         return False
     lens = sorted(stock)
     for L in range(cell, 31, cell):
-        for comp in compositions(L, lens):
+        for comp in compositions(L, lens, stop=stop):
             cnt = Counter(comp)
             if any(p in cnt for p in cls) and all(cnt[q] <= stock[q] for q in cnt):
                 return True
     return False
 
 
-def assign_pieces(runs, stock, must_use=None, node_limit=200_000, piece_cap=None):
+def assign_pieces(
+    runs, stock, must_use=None, node_limit=200_000, piece_cap=None, stop=None
+):
     """
     Can every run be split into collinear pieces from stock?
 
@@ -267,7 +373,7 @@ def assign_pieces(runs, stock, must_use=None, node_limit=200_000, piece_cap=None
     if not stock:
         return None
     runs = [int(r) for r in runs]
-    if sum(runs) > sum(l * c for l, c in stock.items()):
+    if sum(runs) > sum(length * c for length, c in stock.items()):
         return None
     if len(runs) > sum(stock.values()):
         return None
@@ -276,18 +382,24 @@ def assign_pieces(runs, stock, must_use=None, node_limit=200_000, piece_cap=None
         return None
     if piece_cap is not None and piece_cap < len(runs):
         return None  # every run needs >= 1 piece
-    ctx = _build(runs, stock, cls, prefer_few=piece_cap is not None)
+    ctx = _build(runs, stock, cls, prefer_few=piece_cap is not None, stop=stop)
     if ctx is None:
         return None
     if not cls:
-        return _dfs(ctx, 0, node_limit, piece_cap)
-    return _dfs(ctx, 2, node_limit, piece_cap) or _dfs(ctx, 1, node_limit, piece_cap)
+        return _dfs(ctx, 0, node_limit, piece_cap, stop=stop)
+    return _dfs(ctx, 2, node_limit, piece_cap, stop=stop) or _dfs(
+        ctx, 1, node_limit, piece_cap, stop=stop
+    )
 
 
 # ------------------------------------------------------------ angle inventory
 def clean_angle_stock(angle_stock):
     """{"straight": n, "right": n, "diagonal": n}; a missing key = unlimited."""
-    return {k: int(v) for k, v in (angle_stock or {}).items() if v is not None}
+    return {
+        getattr(k, "value", k): int(v)
+        for k, v in (angle_stock or {}).items()
+        if v is not None
+    }
 
 
 def buildable(runs, stock, must_use=None, angle_stock=None, **kw):
@@ -332,15 +444,30 @@ def plan_is_valid(runs, plan, stock, must_use=None):
 
 
 # ---------------------------------------------------------------- candidates
-def best_rectangle(poly, stock, must_use=None, angle_stock=None, angles=None, n_off=3):
+def best_rectangle(
+    poly,
+    stock,
+    must_use=None,
+    angle_stock=None,
+    angles=None,
+    n_off=3,
+    *,
+    stop=None,
+    plan_for=None,
+    on_candidate=None,
+):
     """Largest axis-aligned (in some candidate frame) rectangle, sides
     5..30 in steps of 5, whose 4 walls are buildable from stock."""
     sizes = []
+    if plan_for is None:
+
+        def plan_for(runs):
+            return buildable(runs, stock, must_use, angle_stock, stop=stop)
+
     for wc in range(1, ip.MAX_RUN + 1):
         for hc in range(1, ip.MAX_RUN + 1):
-            if buildable(
-                [wc * 5, wc * 5, hc * 5, hc * 5], stock, must_use, angle_stock
-            ):
+            ip.check_stop(stop)
+            if plan_for([wc * 5, wc * 5, hc * 5, hc * 5]):
                 sizes.append((wc * hc, wc, hc))
     if not sizes:
         return None
@@ -352,22 +479,26 @@ def best_rectangle(poly, stock, must_use=None, angle_stock=None, angles=None, n_
     offs = np.linspace(0, ip.CELL, n_off, endpoint=False)
     frames = []
     for ang in angles:
+        ip.check_stop(stop)
         rp = affinity.rotate(poly, -ang, origin=c0) if ang else Polygon(poly.exterior)
         shapely.prepare(rp)
         minx, miny, maxx, maxy = rp.bounds
         for ox in offs:
             for oy in offs:
+                ip.check_stop(stop)
                 x0, y0 = minx + ox, miny + oy
                 W, H = int((maxx - x0) // ip.CELL), int((maxy - y0) // ip.CELL)
                 if W < 1 or H < 1:
                     continue
-                g = ip.available_mask(rp, x0, y0, W, H)
+                g = ip.available_mask(rp, x0, y0, W, H, stop=stop)
                 S = np.zeros((H + 1, W + 1), dtype=np.int32)
                 S[1:, 1:] = g.cumsum(0).cumsum(1)
                 frames.append((ang, x0, y0, W, H, S))
 
+    best = None
     for _, wc, hc in sizes:  # biggest area first
         for ang, x0, y0, W, H, S in frames:
+            ip.check_stop(stop)
             if wc > W or hc > H:
                 continue
             win = (
@@ -383,8 +514,12 @@ def best_rectangle(poly, stock, must_use=None, angle_stock=None, angles=None, n_
                 if ang:
                     rect = affinity.rotate(rect, ang, origin=c0)
                 if ip.validate(rect, poly):
-                    return rect
-    return None
+                    if on_candidate is None:
+                        return rect
+                    on_candidate(rect)
+                    if best is None or rect.area > best.area:
+                        best = rect
+    return best
 
 
 def _shrunk(poly, d):
@@ -396,22 +531,37 @@ def _shrunk(poly, d):
     return Polygon(p.exterior)
 
 
-def shrink_search(poly, stock, must_use=None, angle_stock=None, **kw):
+def shrink_search(
+    poly,
+    stock,
+    must_use=None,
+    angle_stock=None,
+    *,
+    stop=None,
+    plan_for=None,
+    on_candidate=None,
+    **kw,
+):
     """Smallest inward offset d (integer units) whose re-solved boundary is
     buildable. Probes use cheap solver settings; the winning d is re-solved at
     full quality. Not strictly monotone in d, so this is a heuristic bisection."""
     fast = dict(kw)
     fast.setdefault("n_off", 1)
     fast.setdefault("top_k", 2)
+    if plan_for is None:
+
+        def plan_for(runs):
+            return buildable(runs, stock, must_use, angle_stock, stop=stop)
 
     def attempt(d, kwargs):
+        ip.check_stop(stop)
         sh = _shrunk(poly, d)
         if sh is None:
             return "empty", None, None
-        r = ip.solve(sh, **kwargs)
+        r = ip.solve(sh, stop=stop, on_candidate=on_candidate, **kwargs)
         if r is None:
             return "none", None, None
-        pl = buildable(run_lengths(r), stock, must_use, angle_stock)
+        pl = plan_for(run_lengths(r))
         return ("ok" if pl else "no"), r, pl
 
     lo, d, hit = 0, 1, None
@@ -437,45 +587,110 @@ def shrink_search(poly, stock, must_use=None, angle_stock=None, **kw):
     return hit[1], hit[2]
 
 
-def _search(poly, stock, cells, must_use, bonus_weight, angle_stock=None, **kw):
+def _search(
+    poly,
+    stock,
+    cells,
+    must_use,
+    bonus_weight,
+    angle_stock=None,
+    *,
+    gate_stock=None,
+    stop=None,
+    evaluate=None,
+    **kw,
+):
     stock = clean_stock(stock)
     cands = []
+    plans = {}
+    seen = set()
+
+    def plan_for(runs):
+        key = tuple(sorted(int(r) for r in runs))
+        if key not in plans:
+            if gate_stock is not None:
+                plans[key] = assign_inventory(
+                    key, stock, gate_stock, angle_stock, stop=stop
+                )
+            else:
+                plans[key] = buildable(key, stock, must_use, angle_stock, stop=stop)
+        return plans[key]
+
+    def remember(r, how):
+        ip.check_stop(stop)
+        key = r.wkb
+        if key in seen:
+            return
+        pl = plan_for(run_lengths(r))
+        if pl is None:
+            return
+        # Publish immediately, including a feasible assignment retained when
+        # the optional two-gate search reaches its deadline.
+        score = evaluate(r, pl) if evaluate is not None else None
+        if evaluate is not None and score is None:
+            return
+        if evaluate is None:
+            bonus = (
+                sum(
+                    c
+                    for items in pl.values()
+                    for pieces, c in items
+                    if any(kind == 0 for kind, _ in pieces)
+                )
+                >= 2
+                if gate_stock is not None
+                else bonus_earned(pl, must_use)
+            )
+            score = r.area + bonus_weight * bonus
+        seen.add(key)
+        cands.append((score, r, pl, how))
+
     old_cell, old_run = ip.CELL, ip.MAX_RUN
     try:
         for cell in cells:
+            ip.check_stop(stop)
             ip.CELL, ip.MAX_RUN = cell, 30 // cell
-            r = ip.solve(poly, **kw)
+
+            def publish(r, cell=cell):
+                remember(r, f"grid(cell={cell})")
+
+            r = ip.solve(poly, stop=stop, on_candidate=publish, **kw)
             if r is not None:
-                pl = buildable(run_lengths(r), stock, must_use, angle_stock)
+                pl = plan_for(run_lengths(r))
                 if pl:
-                    cands.append((r, pl, f"unconstrained(cell={cell})"))
+                    remember(r, f"unconstrained(cell={cell})")
                     continue
-            sres = shrink_search(poly, stock, must_use, angle_stock, **kw)
+            sres = shrink_search(
+                poly,
+                stock,
+                must_use,
+                angle_stock,
+                stop=stop,
+                plan_for=plan_for,
+                on_candidate=publish,
+                **kw,
+            )
             if sres is not None:
-                cands.append((sres[0], sres[1], f"shrunk(cell={cell})"))
+                remember(sres[0], f"shrunk(cell={cell})")
+        ip.CELL, ip.MAX_RUN = old_cell, old_run
+        best_rectangle(
+            poly,
+            stock,
+            must_use,
+            angle_stock,
+            stop=stop,
+            plan_for=plan_for,
+            on_candidate=lambda r: remember(r, "rectangle"),
+        )
+    except ip.SearchStopped:
+        pass
     finally:
         ip.CELL, ip.MAX_RUN = old_cell, old_run
 
-    rect = best_rectangle(poly, stock, must_use, angle_stock)
-    if rect is not None:
-        cands.append(
-            (
-                rect,
-                buildable(run_lengths(rect), stock, must_use, angle_stock),
-                "rectangle",
-            )
-        )
-
-    cands = [c for c in cands if c[1]]
     if not cands:
         return None, None, "infeasible"
-    return max(
-        cands,
-        key=lambda c: (
-            c[0].area + bonus_weight * bonus_earned(c[1], must_use),
-            min(class_runs(c[1], must_use), 2),
-        ),
-    )
+    _, r, pl, how = max(cands, key=lambda c: c[0])
+    return r, pl, how
 
 
 def solve_with_stock(
@@ -486,6 +701,9 @@ def solve_with_stock(
     bonus_weight=0.0,
     on_class_impossible="fallback",
     angle_stock=None,
+    gate_stock=None,
+    stop=None,
+    evaluate=None,
     **kw,
 ):
     """
@@ -507,7 +725,15 @@ def solve_with_stock(
                    straight : one per 180-degree joint between collinear pieces.
                    diagonal : not used yet (shapes are rectilinear).
 
-    Class handling, cheapest test first:
+    gate_stock   : when supplied, stock means wall counts and gate_stock holds
+                   separate gate counts. Plans then contain typed (kind, length)
+                   pieces, with kind 0 for gates and 1 for walls.
+    stop         : cooperative CPU deadline callback, checked inside searches.
+    evaluate     : optional (polygon, plan) -> real score, or None to reject.
+                   Called immediately for each buildable candidate, before any
+                   area-only ranking. A timeout preserves the best published one.
+
+    Legacy length-class handling, cheapest test first:
       1. class_usable      : can the pieces balance (right==left, up==down)?
                              If not, no polygon can use a class piece at all.
       2. class_fits_in_run : can a class piece sit inside a run that is a
@@ -515,34 +741,88 @@ def solve_with_stock(
                              If not, walls would have to be shifted by whole
                              units (small area loss; not implemented).
     """
+    # Typed callers pass wall counts as stock and separate gate counts. Their
+    # callback validates/scores every buildable outline before area filtering.
+    if gate_stock is not None:
+        return _search(
+            poly,
+            stock,
+            cells,
+            None,
+            bonus_weight,
+            angle_stock,
+            gate_stock=gate_stock,
+            stop=stop,
+            evaluate=evaluate,
+            **kw,
+        )
+    if stop is not None and stop():
+        return None, None, "time budget reached"
     stock = clean_stock(stock)
     ang = clean_angle_stock(angle_stock)
     if "right" in ang and ang["right"] < 4:
         return None, None, "infeasible (a rectilinear polygon needs >= 4 right angles)"
     if must_use:
         why = None
-        if not class_usable(stock, must_use):
-            why = "balance-impossible"
-        elif not any(class_fits_in_run(stock, must_use, c) for c in cells):
-            why = "needs-wall-shifting"
+        try:
+            if not class_usable(stock, must_use, stop=stop):
+                why = "balance-impossible"
+            elif not any(
+                class_fits_in_run(stock, must_use, c, stop=stop) for c in cells
+            ):
+                why = "needs-wall-shifting"
+        except ip.SearchStopped:
+            return None, None, "time budget reached"
         if why is None:
-            r = _search(poly, stock, cells, must_use, bonus_weight, angle_stock, **kw)
+            r = _search(
+                poly,
+                stock,
+                cells,
+                must_use,
+                bonus_weight,
+                angle_stock,
+                stop=stop,
+                evaluate=evaluate,
+                **kw,
+            )
             if r[0] is not None:
                 return r
             why = "class-unbuildable-with-this-stock"
         if on_class_impossible == "fail":
             return None, None, f"infeasible ({why})"
-        r = _search(poly, stock, cells, None, 0.0, angle_stock, **kw)
+        r = _search(
+            poly,
+            stock,
+            cells,
+            None,
+            0.0,
+            angle_stock,
+            stop=stop,
+            evaluate=evaluate,
+            **kw,
+        )
         if r[0] is None:
             return r
         return r[0], r[1], f"{r[2]} [class unused: {why}]"
-    return _search(poly, stock, cells, None, bonus_weight, angle_stock, **kw)
+    return _search(
+        poly,
+        stock,
+        cells,
+        None,
+        bonus_weight,
+        angle_stock,
+        stop=stop,
+        evaluate=evaluate,
+        **kw,
+    )
 
 
 def diagnose_class(poly, stock, must_use, cells=(5, 10, 15), **kw):
     """Print which stage rejects (or accepts) the must-use class, and why."""
     cleaned = clean_stock(stock)
-    dropped = sorted(l for l, c in stock.items() if int(l) not in cleaned)
+    dropped = sorted(
+        length for length, c in stock.items() if int(length) not in cleaned
+    )
     print(f"stock lengths ignored (outside 5..30 or count 0): {dropped or 'none'}")
     missing = [p for p in must_use if p not in cleaned]
     print(f"class lengths missing from usable stock: {missing or 'none'}")

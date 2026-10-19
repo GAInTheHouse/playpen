@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Fast heuristic: large inscribed polygon with integer sides, every maximal
 straight run in [5, 30], only 90/270 degree corners (in a possibly rotated frame).
@@ -20,6 +21,15 @@ from shapely.geometry import Polygon
 
 CELL = 5  # grid size == minimum side length
 MAX_RUN = 6  # 6 cells * 5 = 30 = maximum straight run
+
+
+class SearchStopped(Exception):
+    """The caller's cooperative CPU budget has expired."""
+
+
+def check_stop(stop):
+    if stop is not None and stop():
+        raise SearchStopped()
 
 
 # ---------------------------------------------------------------- orientation
@@ -61,8 +71,9 @@ def dominant_angles(poly, max_peaks=3, min_sep=5.0):
 
 
 # ------------------------------------------------------------------ grid ops
-def available_mask(poly, x0, y0, W, H):
+def available_mask(poly, x0, y0, W, H, stop=None):
     """bool[H, W]: cell (r, c) is fully inside poly. poly should be prepared."""
+    check_stop(stop)
     xs = x0 + CELL * np.arange(W)
     ys = y0 + CELL * np.arange(H)
     X, Y = np.meshgrid(xs, ys)
@@ -70,20 +81,27 @@ def available_mask(poly, x0, y0, W, H):
     if mask.any():
         boxes = shapely.box(X[mask], Y[mask], X[mask] + CELL, Y[mask] + CELL)
         mask[mask] = shapely.contains(poly, boxes)
+    check_stop(stop)
     return mask
 
 
-def largest_component(g):
+def largest_component(g, stop=None):
     H, W = g.shape
     seen = np.zeros_like(g, dtype=bool)
     best = []
-    for r, c in np.argwhere(g):
+    for index, (r, c) in enumerate(np.argwhere(g)):
+        if index % 256 == 0:
+            check_stop(stop)
         if seen[r, c]:
             continue
         comp = [(r, c)]
         seen[r, c] = True
         dq = deque(comp)
+        visited = 0
         while dq:
+            visited += 1
+            if visited % 256 == 0:
+                check_stop(stop)
             a, b = dq.popleft()
             for na, nb in ((a + 1, b), (a - 1, b), (a, b + 1), (a, b - 1)):
                 if 0 <= na < H and 0 <= nb < W and g[na, nb] and not seen[na, nb]:
@@ -98,7 +116,7 @@ def largest_component(g):
     return out
 
 
-def fix_pinches(g):
+def fix_pinches(g, stop=None):
     """Remove one cell from every diagonal-only contact. Returns (grid, changed)."""
     P = np.pad(g, 1)
     a, b, c, d = P[:-1, :-1], P[:-1, 1:], P[1:, :-1], P[1:, 1:]
@@ -106,8 +124,10 @@ def fix_pinches(g):
     p2 = b & c & ~a & ~d  # / diagonal
     changed = p1.any() or p2.any()
     for r, cc in np.argwhere(p1):
+        check_stop(stop)
         P[r, cc] = False  # top-left cell
     for r, cc in np.argwhere(p2):
+        check_stop(stop)
         P[r, cc + 1] = False  # top-right cell
     return P[1:-1, 1:-1].copy(), changed
 
@@ -117,7 +137,7 @@ def _run_spans(row):
     return zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1))  # [s, e)
 
 
-def cells_to_kill(g):
+def cells_to_kill(g, stop=None):
     """Cells to delete so no straight boundary run exceeds MAX_RUN cells."""
     P = np.pad(g, 1)
     ins = P[1:-1, 1:-1]
@@ -131,6 +151,7 @@ def cells_to_kill(g):
     for k, f in enumerate(flags):
         F = f if k < 2 else f.T
         for i, row in enumerate(F):
+            check_stop(stop)
             for s, e in _run_spans(row):
                 if e - s > MAX_RUN:
                     for j in range(s + MAX_RUN, e, MAX_RUN + 1):
@@ -138,15 +159,16 @@ def cells_to_kill(g):
     return kill
 
 
-def enforce(g, max_iter=1000):
+def enforce(g, max_iter=1000, stop=None):
     for _ in range(max_iter):
-        g = largest_component(g)
+        check_stop(stop)
+        g = largest_component(g, stop=stop)
         if not g.any():
             return None
-        g, pinched = fix_pinches(g)
+        g, pinched = fix_pinches(g, stop=stop)
         if pinched:
             continue
-        kill = cells_to_kill(g)
+        kill = cells_to_kill(g, stop=stop)
         if not kill:
             return g
         rr, cc = zip(*kill)
@@ -200,7 +222,7 @@ def validate(res, src, tol=1e-6):
 
 
 # ---------------------------------------------------------------------- main
-def solve(poly, n_off=3, top_k=6, angles=None):
+def solve(poly, n_off=3, top_k=6, angles=None, *, stop=None, on_candidate=None):
     """
     poly   : shapely Polygon, no holes
     n_off  : grid offsets tried per axis (n_off**2 per angle)
@@ -208,6 +230,7 @@ def solve(poly, n_off=3, top_k=6, angles=None):
              run-cap enforcement
     Returns best valid shapely Polygon, or None.
     """
+    check_stop(stop)
     if angles is None:
         angles = dominant_angles(poly)
     c0 = poly.centroid
@@ -215,23 +238,26 @@ def solve(poly, n_off=3, top_k=6, angles=None):
 
     cands = []
     for ang in angles:
+        check_stop(stop)
         rp = affinity.rotate(poly, -ang, origin=c0) if ang else Polygon(poly.exterior)
         shapely.prepare(rp)
         minx, miny, maxx, maxy = rp.bounds
         for ox in offs:
             for oy in offs:
+                check_stop(stop)
                 x0, y0 = minx + ox, miny + oy
                 W = int((maxx - x0) // CELL)
                 H = int((maxy - y0) // CELL)
                 if W < 1 or H < 1:
                     continue
-                g = available_mask(rp, x0, y0, W, H)
+                g = available_mask(rp, x0, y0, W, H, stop=stop)
                 cands.append((int(g.sum()), ang, x0, y0, g))
 
     cands.sort(key=lambda t: -t[0])
     best = None
     for _, ang, x0, y0, g in cands[:top_k]:
-        g = enforce(g.copy())
+        check_stop(stop)
+        g = enforce(g.copy(), stop=stop)
         if g is None:
             continue
         res = grid_to_polygon(g, x0, y0)
@@ -239,8 +265,11 @@ def solve(poly, n_off=3, top_k=6, angles=None):
             continue
         if ang:
             res = affinity.rotate(res, ang, origin=c0)
-        if validate(res, poly) and (best is None or res.area > best.area):
-            best = res
+        if validate(res, poly):
+            if on_candidate is not None:
+                on_candidate(res)
+            if best is None or res.area > best.area:
+                best = res
     return best
 
 
