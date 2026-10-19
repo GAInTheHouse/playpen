@@ -23,13 +23,20 @@ loop carry over, so a grown loop needs no new search for where it goes.
    the wrong length, and as the charge rises the cheapest fixes (a notch, a step, a
    unit more or less) are bought one by one until every side can be built;
 3. kick: from each loop that is stuck, try the slides that add a face whatever they
-   cost, climb from each, and keep what ends up better.
+   cost, climb from each, and keep what ends up better;
+4. with whatever time is left, simulated annealing (the usual way to search for a
+   maximum-area polygon): try slides picked at random, take every one that helps
+   and some that don't, with a chance that shrinks over time, so the loop can get
+   out of dead ends that climbing can't; part of the time goes to restarts that
+   shake one of the best loops and climb and stretch again. Only the best loop
+   ever seen is kept, so neither can lose ground.
 
 Only loops whose every side can be built are ever given pieces and shown to the
 simulator's validator; the others exist only inside step 2.
 """
 
 import math
+import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -67,6 +74,22 @@ REPAIR_GRACE = 2.0  # CPU seconds a stretch cut short gets to make its loop buil
 # the best loop's first stretch gets the biggest slice of the time: a big room
 # needs it, and what a small room leaves over passes to the next in line
 SLICE_WEIGHTS = (4, 2, 2, 1, 1, 1)
+# restarts: how many of the best loops they start from, how many random slides
+# shake each one, how many candidate slides to sample per shake, and the most
+# time one restart's stretch-and-repair may take
+ELITE = 5
+SHAKES = 3
+SHAKE_SAMPLE = 200
+RESTART_STRETCH = 10.0
+RESTART_SEED = 4444  # the same scenario gives the same restarts every run
+# simulated annealing: its share of the time left after growing (restarts get the
+# rest), the end temperature as a fraction of the starting one, how many moves
+# without a new best before it goes back to the best loop, and how far apart
+# (in cut points) the two ends of a randomly chosen run may be
+ANNEAL_SHARE = 0.25
+ANNEAL_COOLING = 1e-3
+ANNEAL_RESET = 3000
+ANNEAL_REACH = 6
 EPS = 1e-6
 
 Faces = tuple[tuple[int, int], ...]  # (heading index 0..7, length)
@@ -586,6 +609,139 @@ class Grower:
             if not pool or pool[0].score <= best_before + EPS:
                 break
             best_before = pool[0].score
+
+        now = time.process_time()
+        anneal_end = now + max(0.0, deadline - now) * ANNEAL_SHARE
+        self._anneal(pool, anneal_end)
+        self._restart(pool, deadline)
+
+    def _anneal(self, pool: list[Loop], deadline: float) -> None:
+        """Simulated annealing over random slides, from the best loop so far."""
+        if not pool:
+            return
+        rng = random.Random(RESTART_SEED)
+        best = current = max(pool, key=lambda loop: loop.score)
+        steps = sorted(
+            {d for group in self.exact_slides for d in group} | set(self.smallest)
+        )
+        began = time.process_time()
+        span = max(deadline - began, 1e-9)
+        first: list[float] = []  # sizes of the first changes seen, to set the scale
+        start_temp = 0.0
+        since_best = 0
+        state = self._anneal_state(current)
+        while True:
+            now = time.process_time()
+            if now >= deadline:
+                return
+            since_best += 1
+            if since_best > ANNEAL_RESET and current is not best:
+                current, since_best = best, 0
+                state = self._anneal_state(current)
+            move = self._random_slide(current, state, steps, rng)
+            if move is None:
+                continue
+            value, pos, faces = move
+            change = value - current.score
+            if len(first) < 30:
+                first.append(abs(change))
+                if len(first) == 30:
+                    start_temp = max(sorted(first)[15], 1.0)
+                if change <= 0:
+                    continue
+            temp = start_temp * ANNEAL_COOLING ** ((now - began) / span)
+            if change < 0 and rng.random() >= math.exp(change / max(temp, 1e-9)):
+                continue
+            fitting = self._fitting(current, [(value, pos, faces, value, 0)])
+            if not fitting:
+                continue
+            _, start, faces, _, _ = fitting[0]
+            score = self.accept(start, current.heading, faces)
+            if score is None:
+                continue
+            current = Loop(start, current.heading, faces, score)
+            state = self._anneal_state(current)
+            if score > best.score + EPS:
+                best, since_best = current, 0
+                pool.append(current)
+
+    def _anneal_state(self, loop: Loop) -> tuple:
+        """What drawing random slides from a loop needs: its cut points, where
+        they sit, and its area."""
+        cuts = self._cuts(loop, wide=True)
+        starts = corners((0.0, 0.0), loop.faces)
+        at = [
+            (
+                starts[f][0] + offset * DIRECTIONS[loop.faces[f][0]][0],
+                starts[f][1] + offset * DIRECTIONS[loop.faces[f][0]][1],
+            )
+            for f, offset in cuts
+        ]
+        return cuts, at, area_of(starts)
+
+    def _random_slide(self, loop: Loop, state: tuple, steps: list, rng) -> tuple | None:
+        """One random slide that leaves a loop the stock allows, as (the most it
+        could score, where it starts in the loop's frame, faces), or None."""
+        cuts, at, area = state
+        m = len(cuts)
+        if m < 2:
+            return None
+        i = rng.randrange(m)
+        j = (i + rng.randint(1, min(m - 1, ANNEAL_REACH))) % m
+        g = rng.choice(self.directions)
+        d = rng.choice(steps)
+        run = self._between(loop.faces, cuts[i], cuts[j])
+        rest = self._between(loop.faces, cuts[j], cuts[i])
+        pos, new = _normalise(at[j], rest + [(g, d)] + run + [((g + 4) % 8, d)])
+        if len(new) < 4 or len(new) > MAX_FACES:
+            return None
+        ux, uy = DIRECTIONS[g]
+        sweep = (at[j][0] - at[i][0]) * uy - (at[j][1] - at[i][1]) * ux
+        worth = self._worth(new, area - d * sweep)
+        if worth is None or worth[1]:
+            return None
+        return worth[0], pos, tuple(new)
+
+    def _restart(self, pool: list[Loop], deadline: float) -> None:
+        """Shake, climb and stretch the best loops again until time runs out."""
+        rng = random.Random(RESTART_SEED)
+        elite = sorted(pool, key=lambda loop: -loop.score)[:ELITE]
+        while elite and time.process_time() < deadline:
+            loop = rng.choice(elite)
+            for _ in range(rng.randint(1, SHAKES)):
+                shaken = self._shake(loop, rng)
+                if shaken is None or time.process_time() >= deadline:
+                    break
+                loop = shaken
+            loop = self.climb(loop)
+            if rng.random() < 0.5 and time.process_time() < deadline:
+                self.deadline = min(deadline, time.process_time() + RESTART_STRETCH)
+                stretched = self._stretch(loop, rng.random() < 0.5)
+                self.deadline = deadline
+                if stretched is not None:
+                    loop = stretched
+            elite = self._distinct(elite + [loop])[:ELITE]
+
+    def _shake(self, loop: Loop, rng: random.Random) -> Loop | None:
+        """One slide picked at random among those that leave a buildable loop
+        inside the room, whatever it does to the score."""
+        moves = self._moves(loop, self.exact_slides[0], kick=False)
+        moves = moves + self._moves(loop, self.smallest, kick=True)
+        if not moves:
+            return None
+        sample = rng.sample(moves, min(SHAKE_SAMPLE, len(moves)))
+        candidates = [
+            (score, pos, faces, score, over) for pos, faces, score, over in sample
+        ]
+        fitting = self._fitting(loop, candidates)
+        rng.shuffle(fitting)
+        for _, start, faces, _, over in fitting:
+            if over:
+                continue
+            score = self.accept(start, loop.heading, faces)
+            if score is not None:
+                return Loop(start, loop.heading, faces, score)
+        return None
 
     @staticmethod
     def _distinct(loops: list[Loop]) -> list[Loop]:

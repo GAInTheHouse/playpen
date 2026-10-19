@@ -13,6 +13,11 @@ instead of using up one. Two fixes make the outline legal:
 - a straight side longer than the 30-unit face limit gets a notch: one cell along it
   is dropped, which puts two corners in the side.
 
+Every corner takes a right-angle connector, and a stepped edge has a great many. When
+the stock is short, cells are dropped until the outline fits it: on a staircase,
+dropping the top cell of a one-cell step merges two steps into one and saves two
+corners, so each drop is chosen to save the most corners.
+
 Growing a shape one move at a time (freeform.py) covers a big room slowly; this
 covers it in one go, at the price of a stepped edge along walls that are not lined
 up with the grid.
@@ -172,7 +177,74 @@ def _faces(poly: Polygon) -> tuple[tuple[float, float], list]:
     return points[0], faces
 
 
-def raster_loops(region, polygon, headings, cell_sizes, deadline):
+def _corner_count(cells: set, x: int, y: int) -> int:
+    """Whether the grid point at the lower-left of cell (x, y) is a corner of the
+    outline: it is when an odd number of the four cells around it are kept."""
+    around = (
+        ((x - 1, y - 1) in cells)
+        + ((x, y - 1) in cells)
+        + ((x - 1, y) in cells)
+        + ((x, y) in cells)
+    )
+    return around % 2
+
+
+def _corners_total(cells: set) -> int:
+    points = {(x + dx, y + dy) for x, y in cells for dx in (0, 1) for dy in (0, 1)}
+    return sum(_corner_count(cells, x, y) for x, y in points)
+
+
+def _corner_saving(cells: set, cell: tuple[int, int]) -> int:
+    """How many corners dropping `cell` removes (negative if it adds some)."""
+    x, y = cell
+    points = [(x, y), (x + 1, y), (x, y + 1), (x + 1, y + 1)]
+    before = sum(_corner_count(cells, px, py) for px, py in points)
+    cells.discard(cell)
+    after = sum(_corner_count(cells, px, py) for px, py in points)
+    cells.add(cell)
+    return before - after
+
+
+def _fit_corners(
+    cells: set, budget: int, most_x: int, most_y: int, deadline: float
+) -> bool:
+    """Drop cells, those saving the most corners first, until the outline has no
+    more corners than `budget`. False if it can't be done in time."""
+    total = _corners_total(cells)
+    while total > budget:
+        if time.process_time() > deadline:
+            return False
+        edge = [
+            (x, y)
+            for x, y in cells
+            if any((x + dx, y + dy) not in cells for dx, dy in NEIGHBOURS)
+        ]
+        ranked = sorted(
+            ((_corner_saving(cells, cell), cell) for cell in edge), reverse=True
+        )
+        for saving, cell in ranked:
+            if saving <= 0:
+                return False
+            cells.discard(cell)
+            x, y = cell
+            near = [(x + dx, y + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
+            rows, columns = _runs(cells)
+            fine = (
+                not _pinches(cells, near)
+                and all(len(run) <= most_x for run in rows)
+                and all(len(run) <= most_y for run in columns)
+                and _connected(cells)
+            )
+            if fine:
+                total -= saving
+                break
+            cells.add(cell)
+        else:
+            return False
+    return True
+
+
+def raster_loops(region, polygon, headings, cell_sizes, deadline, corner_budget=None):
     """Outlines of blocks of grid cells that fill the room, as
     (start, heading, faces), with faces as (heading in 45-degree steps from
     `heading`, length). `region` is the room buffered by the containment
@@ -213,6 +285,12 @@ def raster_loops(region, polygon, headings, cell_sizes, deadline):
                 _drop_pinches(cells)
                 cells = _component(cells)
                 if not _break_long_sides(cells, most_x, most_y, deadline):
+                    continue
+                if corner_budget is not None and not _fit_corners(
+                    cells, corner_budget, most_x, most_y, deadline
+                ):
+                    continue
+                if len(cells) < 4:
                     continue
                 boxes = [
                     shapely.box(a * w, b * h, (a + 1) * w, (b + 1) * h)

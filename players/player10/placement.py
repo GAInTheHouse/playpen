@@ -248,11 +248,13 @@ class RoomSearch:
         step: int,
         symmetry: int,
         limit: int = 3,
+        only: list[float] | None = None,
     ) -> list[tuple[tuple[float, float], float]]:
         """Up to `limit` (start, heading) pairs at which the shape fits. `step` and
-        `symmetry` say which headings are worth trying (see `headings`)."""
+        `symmetry` say which headings are worth trying (see `headings`); `only`
+        replaces them with a list of its own."""
         local = np.array(vertices, dtype=float)
-        headings = self.headings(step, symmetry)
+        headings = only if only is not None else self.headings(step, symmetry)
         found: list[tuple[tuple[float, float], float]] = []
         for candidates in (self._anchor_offsets, self._contact_offsets):
             for heading in headings:
