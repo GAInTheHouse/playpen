@@ -1,8 +1,10 @@
 """Group 1: local search over a closed loop of straight faces.
 
-Place the smallest rectangle around the room, most open spots first. Grow
-each greedily, then run a softmax local search until it converges or time
-runs out. Return the best loop, with a second gate added if one fits.
+Place the smallest rectangle the stock can build (or, with too few
+right-angle connectors, the smallest hexagon) around the room, most open
+spots first. Grow each greedily, then run a softmax local search
+until it converges or time runs out. Return the best loop, with a second gate
+added if one fits.
 """
 
 import functools
@@ -15,8 +17,9 @@ from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from typing import NamedTuple
 
+import numpy as np
 import shapely
-from shapely.geometry import Point
+from shapely.geometry import box
 
 import src.constants as c
 from players.player0 import Player
@@ -36,6 +39,7 @@ CPU_SECONDS = float(os.environ.get("PLAYER1_CPU_SECONDS", "9"))
 NEARBY_RADIUS = c.MAX_FACE_LENGTH / 2  # what counts as "around" an initial solution
 CONVERGENCE_STEP_NUM = 50  # stop after this many steps without a gain above MIN_GAIN
 MIN_GAIN = 1.0  # score improvement that counts as progress
+MAX_STARTS = 40  # placements kept, more than the search ever reaches
 
 CONNECTOR_FOR_TURN = {  # turn in degrees -> connector
     90: Connector(ConnectorType.RIGHT),
@@ -125,13 +129,6 @@ def to_construction(loop: Loop) -> Construction:
 
 def corners(loop: Loop) -> list[tuple[float, float]]:
     return build_geometry(to_construction(loop))[0]
-
-
-def centre(points) -> tuple[float, float]:
-    return (
-        sum(x for x, _ in points) / len(points),
-        sum(y for _, y in points) / len(points),
-    )
 
 
 class PreparedRoom(Room):
@@ -390,75 +387,138 @@ def smallest_rectangle(inventory: Inventory) -> Loop | None:
     return None
 
 
-def open_floor_around(loop: Loop, room: Room) -> float:
-    """Floor area within NEARBY_RADIUS of the loop's centre: more in an open
-    part of the room than in a narrow passage."""
-    nearby = Point(*centre(corners(loop))).buffer(NEARBY_RADIUS)
-    return room.polygon.intersection(nearby).area
+ANYWHERE = Room(box(-1e5, -1e5, 1e5, 1e5))
 
 
-def room_rotations(room: Room) -> set[float]:
+def buildable(shape: Loop, inventory: Inventory) -> bool:
+    """Whether `shape` passes every check but fitting in the room. None of
+    them change when the shape moves, so this is checked once per shape."""
+    return validate_construction(to_construction(shape), ANYWHERE, inventory).valid
+
+
+def smallest_hexagon(inventory: Inventory) -> Loop | None:
+    """The hexagon with the shortest perimeter the inventory can build, its
+    gate on whichever side takes one, at the origin: a rectangle with two
+    opposite corners cut off at 45 degrees, so it needs only 2 right-angle
+    connectors (and 4 diagonal ones).
+
+               a
+          ┌────────┐
+       d ╱          │
+        ╱           │ b
+       │            │
+     b │           ╱ d
+       │          ╱
+       └─────────┘
+             a
+    """
+    lengths = range(c.MIN_WALL_LENGTH, c.MAX_FACE_LENGTH + 1)
+    for a, b, d in sorted(itertools.product(lengths, repeat=3), key=sum):
+        sides = [(0, a), (45, d), (90, b), (180, a), (225, d), (270, b)]
+        for gate in range(len(sides)):
+            specs = [
+                FaceSpec(direction, length, int(i == gate))
+                for i, (direction, length) in enumerate(sides)
+            ]
+            faces = build_faces(specs, inventory)
+            if faces and len(faces) == len(sides):
+                shape = Loop((0.0, 0.0), 0.0, tuple(faces))
+                if buildable(shape, inventory):
+                    return shape
+    return None
+
+
+def starting_shape(inventory: Inventory) -> Loop | None:
+    """The smallest rectangle; with too few right-angle connectors for one,
+    the smallest hexagon."""
+    rectangle = smallest_rectangle(inventory)
+    if rectangle and buildable(rectangle, inventory):
+        return rectangle
+    connectors = inventory.connectors
+    if connectors.get(ConnectorType.RIGHT, 0) < 2:
+        return None
+    if connectors.get(ConnectorType.DIAGONAL, 0) < 4:
+        return None
+    return smallest_hexagon(inventory)
+
+
+def room_rotations(room: Room, shape: Loop) -> set[float]:
+    """Every direction a room wall runs in, turned in 90-degree steps, or
+    45-degree steps for a shape with diagonal sides (the hexagon)."""
+    step = 45 if any(face.direction % 90 for face in shape.faces) else 90
     return {
-        round(math.degrees(math.atan2(y2 - y1, x2 - x1)) % 90, 6) + quarter
+        round(math.degrees(math.atan2(y2 - y1, x2 - x1)) % step, 6) + k * step
         for (x1, y1), (x2, y2) in itertools.pairwise(room.polygon.exterior.coords)
-        for quarter in (0, 90, 180, 270)
+        for k in range(360 // step)
     }
 
 
-def all_corners_inside(floor, starts, shape_corners) -> list[bool]:
-    """For each start, whether the shape placed there has every corner on
-    `floor`, tested for all starts at once."""
-    xs = [x + sx for x, _ in starts for sx, _ in shape_corners]
-    ys = [y + sy for _, y in starts for _, sy in shape_corners]
-    return shapely.contains_xy(floor, xs, ys).reshape(len(starts), -1).all(axis=1)
-
-
-def placements_at(
-    shape: Loop, rotation: float, room: PreparedRoom, inventory: Inventory
-) -> list[Loop]:
-    """Valid placements of `shape` centred on a grid point or cornered on a
-    room corner."""
+def placements_at(shape: Loop, rotation: float, room: PreparedRoom) -> list:
+    """(centre, placement) for each placement of `shape` that fits in the
+    room, centred on a grid point or cornered on a room corner. Every
+    placement is tested at once."""
     min_x, min_y, max_x, max_y = room.polygon.bounds
     step = c.MIN_WALL_LENGTH
-    grid = [
-        (min_x + i * step, min_y + j * step)
-        for i in range(int((max_x - min_x) / step) + 1)
-        for j in range(int((max_y - min_y) / step) + 1)
-    ]
-    turned = replace(shape, rotation=rotation)
-    shape_corners = corners(turned)
-    middle_x, middle_y = centre(shape_corners)
-    starts = [(x - middle_x, y - middle_y) for x, y in grid]
-    room_corners = room.polygon.exterior.coords[:-1]
-    starts += [(x - sx, y - sy) for x, y in room_corners for sx, sy in shape_corners]
-    inside = all_corners_inside(room.floor, starts, shape_corners)
-    loops = [turned.moved_to(start) for start, ok in zip(starts, inside) if ok]
-    return [
-        loop
-        for loop in loops
-        if validate_construction(to_construction(loop), room, inventory).valid
-    ]
-
-
-def initial_solutions(
-    shape: Loop, room: PreparedRoom, inventory: Inventory, deadline: float
-) -> list[Loop]:
-    """Placements of `shape`, most open floor first, spaced apart."""
-    placed = []
-    for rotation in room_rotations(room):
-        if time.process_time() >= deadline:
-            break  # a room with very many wall directions: keep what we have
-        placed += [
-            (open_floor_around(loop, room), loop)
-            for loop in placements_at(shape, rotation, room, inventory)
+    grid = np.array(
+        [
+            (min_x + i * step, min_y + j * step)
+            for i in range(int((max_x - min_x) / step) + 1)
+            for j in range(int((max_y - min_y) / step) + 1)
         ]
-    placed.sort(key=lambda placement: placement[0], reverse=True)
+    )
+    turned = replace(shape, rotation=rotation)
+    shape_corners = np.array(corners(turned))
+    middle = shape_corners.mean(axis=0)
+    room_corners = np.array(room.polygon.exterior.coords[:-1])
+    starts = np.concatenate(
+        [
+            grid - middle,
+            (room_corners[:, None, :] - shape_corners[None, :, :]).reshape(-1, 2),
+        ]
+    )
+    placed = shapely.polygons(starts[:, None, :] + shape_corners[None, :, :])
+    starts = starts[shapely.contains(room.floor, placed)]
+    return [
+        (tuple(np.round(start + middle, 1)), turned.moved_to(tuple(start)))
+        for start in starts
+    ]
+
+
+def open_floor(centres, room: Room) -> dict:
+    """Floor area within NEARBY_RADIUS of each centre, to the nearest unit:
+    more in an open part of the room than in a narrow passage."""
+    centres = sorted(set(centres))
+    nearby = shapely.buffer(shapely.points(centres), NEARBY_RADIUS)
+    areas = shapely.area(shapely.intersection(room.polygon, nearby))
+    return dict(zip(centres, np.round(areas)))
+
+
+def initial_solutions(shape: Loop, room: PreparedRoom, deadline: float) -> list[Loop]:
+    """Placements of `shape`, most open floor first, centres spaced apart,
+    at most MAX_STARTS of them."""
+    placed = []
+    for rotation in sorted(room_rotations(room, shape)):
+        if placed and time.process_time() >= deadline:
+            break  # a room with very many wall directions: keep what we have
+        placed += placements_at(shape, rotation, room)
+    if not placed:
+        return []
+    floor = open_floor((middle for middle, _ in placed), room)
+    placed.sort(key=lambda placement: floor[placement[0]], reverse=True)
     chosen: list[Loop] = []
-    for _, loop in placed:
-        if chosen and time.process_time() >= deadline:
+    centres: dict[tuple[int, int], list] = {}  # chosen centres, by 5x5 square
+    for middle, loop in placed:
+        if len(chosen) == MAX_STARTS:
             break
-        if all(math.dist(loop.start, o.start) >= c.MIN_WALL_LENGTH for o in chosen):
+        i, j = (int(v // c.MIN_WALL_LENGTH) for v in middle)
+        near = (
+            other
+            for di, dj in itertools.product((-1, 0, 1), repeat=2)
+            for other in centres.get((i + di, j + dj), ())
+        )
+        if all(math.dist(middle, other) >= c.MIN_WALL_LENGTH for other in near):
             chosen.append(loop)
+            centres.setdefault((i, j), []).append(middle)
     return chosen
 
 
@@ -539,23 +599,21 @@ class Player1(Player):
 
     def build_enclosure(self) -> Construction | None:
         deadline = time.process_time() + CPU_SECONDS  # covers placing and growing too
-        shape = smallest_rectangle(self.inventory)
-        placements = (
-            initial_solutions(shape, self.room, self.inventory, deadline)
-            if shape
-            else []
-        )
-        if not placements:
-            self.note = "no rectangle fits: nothing built"
-            return None
+        shape = starting_shape(self.inventory)
+        placements = initial_solutions(shape, self.room, deadline) if shape else []
 
         random_state = random.Random(0)
         results = []
         for placement in placements:
             if results and time.process_time() >= deadline:
                 break  # out of time; the first start is always searched
+            if self.evaluate(placement) is None:
+                continue  # fits only within rounding error
             grown = self.hill_climb(placement, (resize_face,), deadline)
             results.append(self.anneal(grown.loop, deadline, random_state))
+        if not results:
+            self.note = "no starting shape fits: nothing built"
+            return None
         best = max(results, key=lambda result: result.score)
         best = self.hill_climb(best.loop, (add_gate_to_face,), math.inf)
         self.note = f"{len(placements)} initial solutions; best {best.score:.0f} ({len(best.loop.faces)} faces)"
