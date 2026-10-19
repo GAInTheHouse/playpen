@@ -33,7 +33,11 @@ class FaceCatalog:
     whether it contains a gate. Remaining stock is a tuple of counts, one per
     entry of `kinds`."""
 
-    def __init__(self, inventory: Inventory):
+    def __init__(
+        self,
+        inventory: Inventory,
+        max_pieces_per_face: int = MAX_PIECES_PER_FACE,
+    ):
         usable = range(MIN_WALL_LENGTH, MAX_FACE_LENGTH + 1)
         self.kinds: list[Piece] = [
             Piece(PieceType.WALL, length)
@@ -48,7 +52,7 @@ class FaceCatalog:
         self.stock = tuple(pool[k.piece_type][k.length] for k in self.kinds)
 
         options: dict[tuple[int, bool], list[FaceOption]] = {}
-        for size in range(1, MAX_PIECES_PER_FACE + 1):
+        for size in range(1, max_pieces_per_face + 1):
             for combo in combinations_with_replacement(range(len(self.kinds)), size):
                 length = sum(self.kinds[i].length for i in combo)
                 if length > MAX_FACE_LENGTH:
@@ -76,22 +80,10 @@ class FaceCatalog:
         self, remaining: tuple[int, ...], length: int, with_gate: bool
     ) -> FaceOption | None:
         """The preferred face of this length the remaining stock can still build."""
-        return next(iter(self.options(remaining, length, with_gate)), None)
-
-    def options(
-        self, remaining: tuple[int, ...], length: int, with_gate: bool
-    ) -> tuple[FaceOption, ...]:
-        """All currently buildable alternatives for a face.
-
-        Options with the same length can consume very different pieces. The
-        search needs to retain those alternatives because preserving a scarce
-        piece can determine whether the rest of a loop is completable.
-        """
-        return tuple(
-            option
-            for option in self._options.get((length, with_gate), ())
-            if all(remaining[i] >= n for i, n in option.uses)
-        )
+        for option in self._options.get((length, with_gate), ()):
+            if all(remaining[i] >= n for i, n in option.uses):
+                return option
+        return None
 
     def total_length(self, remaining: tuple[int, ...]) -> int:
         return sum(k.length * n for k, n in zip(self.kinds, remaining))
