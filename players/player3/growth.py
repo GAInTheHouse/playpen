@@ -191,7 +191,7 @@ def grow_enclosure(
 
     All current fronts' union must fit a single inventory before committing a
     move. Removed internal walls can be reused. Unmerged fronts are alternative
-    finished enclosures; at the deadline the largest is returned.
+    finished enclosures; return the highest-scoring validated enclosure found.
     """
     seed_result = validate_construction(initial, room, inventory)
     seed = seed_result.polygon
@@ -254,7 +254,7 @@ def grow_enclosure(
     }
     cache = {}
     prepared_room = prep(room.polygon.buffer(TOL))
-    best_finished = [seed.area, initial]
+    best_finished = [score_construction(seed_result, weights), seed.area, initial]
 
     def pack(polygon):
         if time.process_time() >= deadline:
@@ -272,6 +272,11 @@ def grow_enclosure(
             result = validate_construction(construction, room, inventory)
             if not result.valid:
                 construction = None
+            else:
+                # Keep a valid answer even if later growth or merging scores worse.
+                score = score_construction(result, weights)
+                if score > best_finished[0] + TOL:
+                    best_finished[:] = [score, result.area, construction]
         if time.process_time() < deadline:
             cache[key] = construction
         return construction
@@ -285,8 +290,6 @@ def grow_enclosure(
         )
         if pack(shared) is None:
             return None
-        if candidate.area > best_finished[0] + TOL:
-            best_finished[:] = [candidate.area, construction]
         return construction
 
     def rank(front, candidate):
@@ -508,23 +511,15 @@ def grow_enclosure(
                     break
         if not progressed and all(f.exhausted for f in fronts):
             break
-    winner = max(
-        fronts,
-        key=lambda f: (
-            f.polygon.area,
-            score_construction(
-                validate_construction(f.construction, room, inventory), weights
-            ),
-        ),
+    winner = next(
+        (front for front in fronts if front.construction is best_finished[2]), None
     )
     stats.update(
         active_fronts=len(fronts),
-        final_area=winner.polygon.area,
-        winning_fronts=sorted(winner.members),
+        final_area=best_finished[1],
+        winning_fronts=sorted(winner.members) if winner else [],
         front_areas=[front.polygon.area for front in fronts],
     )
-    if best_finished[0] > winner.polygon.area + TOL:
-        stats["final_area"] = best_finished[0]
+    if winner is None:
         stats["returned_beam_alternative"] = True
-        return best_finished[1], stats
-    return winner.construction, stats
+    return best_finished[2], stats
