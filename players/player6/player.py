@@ -7,24 +7,30 @@ from shapely import Polygon
 
 from players.player0 import Player
 from players.player6.diagonal_search import DiagonalSearch
+from players.player6.local_search import Local45Search, LocalSearchStats
 from players.player6.polygon import find_fit
+from players.player6.time_budget import make_budget
+from src.constants import BASELINE_SCORE, MAX_FACE_LENGTH
 from src.enclosure import Construction, score_construction, validate_construction
 from src.pieces import Connector, ConnectorType, Piece, PieceType
 
 
 class Player6(Player):
-    """Group 6: <one line on your strategy -- fill this in>."""
+    """Group 6: inventory-aware grid/beam search with local 45-degree refinement."""
 
     GATE = 0
     WALL = 1
-    SEARCH_SECONDS = 45.0
-    DIAGONAL_SECONDS = 20.0
     STEPS = (
         (1, 0),
         (0, 1),
         (-1, 0),
         (0, -1),
     )
+
+    def __init__(self, room, inventory, weights, *, cpu_limit=None, stage_limits=None):
+        super().__init__(room, inventory, weights)
+        self.cpu_limit = cpu_limit
+        self.stage_limits = dict(stage_limits or {})
 
     class Edge:
         """Represent one straight face, possibly assembled from multiple walls
@@ -626,6 +632,120 @@ class Player6(Player):
 
         return rectangles + shape_options
 
+    def _consider_inscribed(self, polygon, plan):
+        """Convert a typed stock plan without consuming it or the inventory."""
+        polygon = polygon.simplify(1e-8, preserve_topology=True)
+        coords = list(polygon.exterior.coords)[:-1]
+        pools = {length: list(items) for length, items in plan.items()}
+        edges, turns = [], []
+        for i, curr in enumerate(coords):
+            next_point = coords[(i + 1) % len(coords)]
+            after = coords[(i + 2) % len(coords)]
+            dx, dy = next_point[0] - curr[0], next_point[1] - curr[1]
+            length = round(math.hypot(dx, dy))
+            options = pools.get(length)
+            if not options:
+                return None
+            pieces, count = options[0]
+            edges.append(Player6.Edge(list(pieces), length, len(pieces) - 1))
+            if count == 1:
+                options.pop(0)
+            else:
+                options[0] = (pieces, count - 1)
+            nx, ny = after[0] - next_point[0], after[1] - next_point[1]
+            turn = round(math.degrees(math.atan2(dx * ny - dy * nx, dx * nx + dy * ny)))
+            if abs(turn) != 90:
+                return None
+            turns.append(turn)
+        shape = Player6.Shape(edges, turns, coords)
+        return self._consider_shape(shape, (None, (0, 0, 0)))
+
+    def full_checks(self):
+        from players.player6.inscribed_polygon_stock import solve_with_stock
+
+        # Respect the overall orthogonal deadline, reserving the diagonal
+        # branch's budget even when the grid solver hits a difficult inventory.
+        grid_seconds = getattr(self, "_grid_seconds", None)
+        if grid_seconds is None:
+            grid_seconds = make_budget(
+                self.inventory, cpu_limit=self.cpu_limit, stage_limits=self.stage_limits
+            ).grid_seconds
+        deadline = min(
+            getattr(self, "_deadline", math.inf),
+            time.process_time() + grid_seconds,
+        )
+        angle_stock = {
+            kind.value: self.inventory.connectors.get(kind, 0) for kind in ConnectorType
+        }
+        solve_with_stock(
+            self.room.polygon,
+            self.inventory.walls,
+            gate_stock=self.inventory.gates,
+            cells=tuple(range(5, 31)),
+            angle_stock=angle_stock,
+            stop=lambda: time.process_time() >= deadline,
+            evaluate=self._consider_inscribed,
+        )
+
+    def _improve_local(self, deadline):
+        budget = min(
+            self._local_seconds - self.local_stats.cpu_seconds,
+            deadline - time.process_time(),
+        )
+        if (
+            self.best_construction is None
+            or budget <= 0
+            or self.inventory.connectors.get(ConnectorType.DIAGONAL, 0) < 4
+        ):
+            return
+        search = Local45Search(
+            self.room,
+            self.inventory,
+            self.weights,
+            time_budget=budget,
+            stop=lambda: time.process_time() >= deadline,
+        )
+        candidate = search.improve(self.best_construction)
+        for name, value in vars(search.stats).items():
+            setattr(self.local_stats, name, getattr(self.local_stats, name) + value)
+        if candidate is not None:
+            result = validate_construction(candidate, self.room, self.inventory)
+            if result.valid:
+                score = score_construction(result, self.weights)
+                if score > self.best_score:
+                    self.best_score = score
+                    self.best_construction = candidate
+                    self.best_shape = None
+                    self.best_fit = None
+
+    def _beam_score_upper_bound(self):
+        """An optimistic bound for the beam's face limit, ignoring perimeter cost."""
+        corners = sum(
+            max(0, self.inventory.connectors.get(kind, 0))
+            for kind in (ConnectorType.RIGHT, ConnectorType.DIAGONAL)
+        )
+        perimeter = min(
+            MAX_FACE_LENGTH * min(DiagonalSearch.MAX_FACES, corners),
+            sum(
+                length * max(0, count)
+                for stock in (self.inventory.walls, self.inventory.gates)
+                for length, count in stock.items()
+                if 5 <= length <= MAX_FACE_LENGTH
+            ),
+        )
+        area = min(self.room.polygon.area, perimeter * perimeter / (4 * math.pi))
+        bonus = (
+            self.weights.G
+            if sum(
+                max(0, count)
+                for length, count in self.inventory.gates.items()
+                if 5 <= length <= MAX_FACE_LENGTH
+            )
+            >= 2
+            else 0
+        )
+        return BASELINE_SCORE + max(0, self.weights.A * area) + bonus
+
     def build_enclosure(self) -> Construction | None:
         # Set up for you by Player.__init__:
         #   self.room       the room footprint (self.room.polygon is a shapely Polygon;
@@ -647,37 +767,64 @@ class Player6(Player):
         # PLACEMENT_GUIDE.md covers placing a shape in the room; SIMULATOR_GUIDE.md
         # covers everything else; players/example_player.py is a worked example.
 
-        # Keep the supplied inventory unchanged, and return the best validated
-        # construction before the submission checker's 60-second CPU limit.
-        overall_deadline = time.process_time() + self.SEARCH_SECONDS
+        # Refresh from the current simulator run, including each GUI click.
+        budget = make_budget(
+            self.inventory, cpu_limit=self.cpu_limit, stage_limits=self.stage_limits
+        )
+        self.budget_info = budget
+        self._grid_seconds = budget.grid_seconds
+        self._local_seconds = budget.local_seconds
+        overall_deadline = budget.deadline
         has_diagonals = self.inventory.connectors.get(ConnectorType.DIAGONAL, 0) >= 2
-        self._deadline = (
-            overall_deadline - min(self.DIAGONAL_SECONDS, self.SEARCH_SECONDS)
-            if has_diagonals
-            else overall_deadline
+        self._deadline = budget.grid_deadline
+        self.note = (
+            f"CPU budget {budget.cpu_limit:g}s ({budget.source}); "
+            f"search {budget.usable_seconds:.2f}s, reserve {budget.safety_seconds:.2f}s; "
+            f"grid <= {budget.grid_seconds:.2f}s, local <= {budget.local_seconds:.2f}s; "
+            "beam reuses unused time"
         )
         self._fit_cache = {}
         self.best_shape = None
         self.best_fit = None
         self.best_score = 0
         self.best_construction = None
+        self.local_stats = LocalSearchStats()
+        self.beam_skipped = False
 
         self.possible_faces = {}
         if not self.inventory.has_gate():
             return None
         self.enumerate_faces()
+        self.full_checks()
+
+        self._deadline = budget.orthogonal_deadline
+        self.enumerate_faces()  # complete any library truncated by the grid deadline
         self.generate_quads()
         self.generate_quad_shapes()
+        # Use only spare orthogonal-stage time, preserving the beam budget.
+        self._improve_local(self._deadline)
 
-        # Keep the rectangle/L result as a fallback. Spend only the reserved
-        # time on the other branch's exact 45-degree beam search.
-        seconds_left = overall_deadline - time.process_time()
-        if has_diagonals and seconds_left > 0:
+        # Reclaim unused grid/rectangle time, keeping the remaining local budget.
+        local_left = max(0.0, budget.local_seconds - self.local_stats.cpu_seconds)
+        seconds_left = max(0.0, overall_deadline - time.process_time() - local_left)
+        if self.stage_limits.get("beam") is not None:
+            seconds_left = min(seconds_left, budget.beam_seconds)
+        self.beam_upper_bound = self._beam_score_upper_bound()
+        if (
+            has_diagonals
+            and seconds_left > 0
+            and self.beam_upper_bound + 1e-7 <= self.best_score
+        ):
+            self.beam_skipped = True
+            self.note += (
+                "; beam skipped: its score upper bound cannot beat the incumbent"
+            )
+        if has_diagonals and seconds_left > 0 and not self.beam_skipped:
             diagonal = DiagonalSearch(
                 self.room,
                 self.inventory,
                 self.weights,
-                time_budget=min(self.DIAGONAL_SECONDS, seconds_left),
+                time_budget=seconds_left,
                 face_library=self.possible_faces or None,
             ).build_enclosure()
             if diagonal is not None:
@@ -688,4 +835,7 @@ class Player6(Player):
                         self.best_score = score
                         self.best_construction = diagonal
 
+        # A later beam result may have a useful local move too. Both calls
+        # share the dynamic local budget and the same overall deadline.
+        self._improve_local(overall_deadline)
         return self.best_construction
