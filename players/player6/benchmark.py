@@ -19,6 +19,7 @@ from pathlib import Path
 import shapely
 from shapely.geometry import box
 
+from players.player6.local_search import LocalSearchStats
 from players.player6.player import Player6
 from src.enclosure import score_construction, validate_construction
 from src.inventory import Inventory
@@ -69,7 +70,7 @@ def scenarios():
         "scarce_seed1": generate_scenario(1, difficulty="scarce"),
         "scarce_seed2": generate_scenario(2, difficulty="scarce"),
     }
-    for name in ("narrow", "spiral"):
+    for name in ("narrow", "spiral", "diagonal_hexagon"):
         cases[name] = read_scenario(
             str(ROOT / "scenarios" / "players" / "player6" / f"{name}.json")
         )
@@ -152,6 +153,12 @@ def run_case(
     row["grid_cpu_seconds"] = player.grid_cpu_seconds if player is not None else 0.0
     row["beam_skipped"] = getattr(player, "beam_skipped", False)
     row["beam_score_upper_bound"] = getattr(player, "beam_upper_bound", None)
+    row["phase_seconds"] = dict(getattr(player, "phase_seconds", {}))
+    history = getattr(player, "beam_history", [])
+    row["beam_history"] = list(history)
+    row["beam_improvement_count"] = len(history)
+    staircase_stats = getattr(player, "inscribed_diagonal_stats", LocalSearchStats())
+    row["staircase_stats"] = asdict(staircase_stats)
     stats = (
         asdict(player.local_stats)
         if player is not None and hasattr(player, "local_stats")

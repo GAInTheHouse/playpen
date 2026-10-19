@@ -8,7 +8,7 @@ are inside `players/player6/`.
 From the repository root:
 
 ```bash
-uv run python -m unittest players.player6.test_player players.player6.test_inscribed players.player6.test_local_search players.player6.test_benchmark players.player6.test_time_budget
+uv run python -m unittest players.player6.test_player players.player6.test_inscribed players.player6.test_local_search players.player6.test_benchmark players.player6.test_time_budget players.player6.test_integration
 uv run ruff check players/player6
 uv run python -m scripts.check_submission 6 --no-run
 ```
@@ -63,10 +63,16 @@ Increasing time cannot improve a stage whose candidate set is exhausted.
 A single native geometry call may exceed a cooperative deadline until it returns;
 the simulator's hard CPU guard remains authoritative.
 
+Each run also reports actual CPU time for face-library generation, the grid,
+orthogonal placement, local refinement, and beam search. `phase_seconds` keeps
+these measurements; `beam_history` records improvements as `(CPU seconds since
+the start of this run, full simulator score)`. Both appear in benchmark JSON/CSV,
+and the run note retains the budget explanation along with the measurements.
+
 ## Benchmarking
 
 ```bash
-# Full comparison on eight cases, including spiral and two fixed scarce seeds.
+# Comparison on nine cases, including spiral, diagonal hexagon, and two scarce seeds.
 uv run python -m players.player6.benchmark
 
 # Repeat selected cases to assess variation under CPU deadlines.
@@ -134,3 +140,18 @@ The pass is intentionally limited: it keeps existing material assignments,
 uses only this paired-diagonal neighborhood and a few translations, and may
 find no move when stock, connectors, placement, or remaining time are tight.
 The general beam search remains necessary.
+
+## Experimental staircase replacement
+
+`inscribed_diagonal.py` provides a second local neighborhood: replace two
+opposite staircases with equal-length diagonal faces and reassign the pieces.
+It remains disabled by default (`Player6.INSCRIBED_DIAGONALS = False`). The
+original branch did not observe a final-score improvement from enabling it.
+
+For experiments, set `player.INSCRIBED_DIAGONALS = True` before running. It shares
+the existing local-refinement CPU quota, including time used by enumeration,
+material assignment, and placement. Only official-validator-approved score
+improvements are retained. Separate `inscribed_diagonal_stats` track attempts,
+feasible candidates, accepted improvements, and CPU time. Deadline checks cover
+staircase and pair enumeration too. The `diagonal_hexagon` benchmark case is a
+small room with diagonal boundaries for testing these strategies.
