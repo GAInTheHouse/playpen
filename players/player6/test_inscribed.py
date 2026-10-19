@@ -224,6 +224,7 @@ class InscribedSearchTests(unittest.TestCase):
             patch.object(player, "generate_quad_shapes"),
             patch("players.player6.player.DiagonalSearch") as beam,
         ):
+            beam.MAX_FACES = 12
             beam.return_value.build_enclosure.return_value = two.to_construction(
                 (0, 0), 0
             )
@@ -258,7 +259,7 @@ class InscribedSearchTests(unittest.TestCase):
             [5] * 4, player.inventory.walls, player.inventory.gates
         )
         player._consider_inscribed(box(0, 0, 5, 5), plan)
-        player.INSCRIBED_SECONDS = 0.02
+        player.stage_limits["grid"] = 0.02
         started = time.process_time()
         player.full_checks()
         self.assertLess(time.process_time() - started, 0.5)

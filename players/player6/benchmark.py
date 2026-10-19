@@ -2,13 +2,15 @@
 
 Run from the repository root: python -m players.player6.benchmark
 Only files under players/player6 are written by default. Both variants use
-identical overall, grid, and beam CPU budgets and fresh copies of each scenario.
+the same overall CPU limit and fresh copies of each scenario. Stage caps are
+optional; by default Player6 dynamically allocates the simulator CPU budget.
 """
 
 import argparse
 import csv
 import json
 import logging
+import math
 import platform
 import time
 from dataclasses import asdict
@@ -91,9 +93,9 @@ def run_case(
     variant,
     *,
     search_seconds=45.0,
-    grid_seconds=20.0,
-    beam_seconds=20.0,
-    local_seconds=2.0,
+    grid_seconds=None,
+    beam_seconds=None,
+    local_seconds=None,
     repeat=1,
 ):
     player = None
@@ -110,17 +112,21 @@ def run_case(
         "second_gate_bonus": False,
         "reason": "no solution",
     }
-    cpu = CpuLimit(search_seconds + 5.0)
+    cpu = CpuLimit(search_seconds)
     started = time.perf_counter()
     try:
         with cpu:
             player = MeasuredPlayer(
-                scenario.room.copy(), scenario.inventory.copy(), scenario.weights
+                scenario.room.copy(),
+                scenario.inventory.copy(),
+                scenario.weights,
+                cpu_limit=search_seconds,
+                stage_limits={
+                    "grid": grid_seconds,
+                    "beam": beam_seconds,
+                    "local": 0.0 if variant == "baseline" else local_seconds,
+                },
             )
-            player.SEARCH_SECONDS = search_seconds
-            player.INSCRIBED_SECONDS = grid_seconds
-            player.DIAGONAL_SECONDS = beam_seconds
-            player.LOCAL_SECONDS = 0.0 if variant == "baseline" else local_seconds
             construction = player.build_enclosure()
     except PlayerTimeout as error:
         row.update(status="timeout", reason=str(error))
@@ -144,6 +150,8 @@ def run_case(
         player is None or player.inventory == scenario.inventory
     )
     row["grid_cpu_seconds"] = player.grid_cpu_seconds if player is not None else 0.0
+    row["beam_skipped"] = getattr(player, "beam_skipped", False)
+    row["beam_score_upper_bound"] = getattr(player, "beam_upper_bound", None)
     stats = (
         asdict(player.local_stats)
         if player is not None and hasattr(player, "local_stats")
@@ -151,6 +159,18 @@ def run_case(
     )
     for key in ("attempted", "feasible", "accepted", "cpu_seconds"):
         row[f"local_{key}"] = stats.get(key, 0)
+    budget = getattr(player, "budget_info", None)
+    for key in (
+        "cpu_limit",
+        "available_seconds",
+        "usable_seconds",
+        "safety_seconds",
+        "grid_seconds",
+        "beam_seconds",
+        "local_seconds",
+        "source",
+    ):
+        row[f"budget_{key}"] = getattr(budget, key, None)
     return row
 
 
@@ -171,7 +191,8 @@ def write_report(path, rows, config):
     lines = [
         "# Player6 local 45-degree benchmark",
         "",
-        "Baseline disables local refinement; local45 enables it. All other CPU budgets are equal.",
+        "Baseline disables local refinement; local45 enables it. Both have the same overall CPU limit.",
+        "Null stage caps mean automatic proportional allocation; unused stage time is reclaimed.",
         "CPU time includes player construction and search; final verification is outside that budget.",
         "Deadline-limited runs can vary. These cases do not establish a global improvement guarantee.",
         "",
@@ -203,10 +224,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", action="append", choices=cases, dest="cases")
     parser.add_argument("--repeats", type=int, default=1)
-    parser.add_argument("--search-seconds", type=float, default=45.0)
-    parser.add_argument("--grid-seconds", type=float, default=20.0)
-    parser.add_argument("--beam-seconds", type=float, default=20.0)
-    parser.add_argument("--local-seconds", type=float, default=2.0)
+    parser.add_argument("--search-seconds", "--cpu-limit", type=float, default=45.0)
+    parser.add_argument("--grid-seconds", type=float, default=None)
+    parser.add_argument("--beam-seconds", type=float, default=None)
+    parser.add_argument("--local-seconds", type=float, default=None)
     parser.add_argument(
         "--output",
         type=Path,
@@ -215,8 +236,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if (
         args.repeats < 1
+        or not math.isfinite(args.search_seconds)
         or args.search_seconds <= 0
-        or min(args.grid_seconds, args.beam_seconds, args.local_seconds) < 0
+        or any(
+            value is not None and (not math.isfinite(value) or value < 0)
+            for value in (args.grid_seconds, args.beam_seconds, args.local_seconds)
+        )
     ):
         parser.error(
             "repeats/search budget must be positive; other budgets must be nonnegative"

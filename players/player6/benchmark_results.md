@@ -1,5 +1,7 @@
 # Player6 local 45-degree benchmark
 
+Historical report: fixed budgets, before dynamic CPU allocation and beam upper-bound pruning.
+
 Baseline disables local refinement; local45 enables it. All other CPU budgets are equal.
 CPU time includes player construction and search; final verification is outside that budget.
 Deadline-limited runs can vary. These cases do not establish a global improvement guarantee.
