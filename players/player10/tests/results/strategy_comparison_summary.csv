@@ -1,0 +1,4 @@
+strategy,scenarios,valid,total_score,mean_score,median_score,total_cpu,mean_cpu,median_cpu,positive_best_or_tied,unique_wins
+current,46,43,345840.575,7518.273,1981.061,1106.928,24.064,6.629,31,3
+original,46,43,339393.903,7378.128,1897.132,589.639,12.818,6.31,28,1
+circuit,46,43,334107.087,7263.198,1916.061,4927.904,107.128,87.505,38,11

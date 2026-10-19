@@ -9,13 +9,16 @@ by construction, so a candidate only ever fails on containment or inventory.
 Return the best loop seen, or None if no rectangle fits.
 """
 
+import functools
+import itertools
 import math
 import os
 import random
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
-from typing import Iterator
 
+import shapely
 from shapely.geometry import Point
 
 import src.constants as c
@@ -30,11 +33,9 @@ from src.inventory import Inventory
 from src.pieces import Connector, ConnectorType, Piece, PieceType
 from src.room import Room
 
-# the only setting: search time, most of the simulator's CPU limit (set
-# PLAYER1_CPU_SECONDS=20 in the environment for quick development runs)
-CPU_SECONDS = float(
-    os.environ.get("PLAYER1_CPU_SECONDS", 0.01 * c.CPU_TIME_LIMIT_SECONDS)
-)
+# the only setting: total CPU time per room, kept under 10 s (a search step can
+# run a little past it); set PLAYER1_CPU_SECONDS in the environment to override
+CPU_SECONDS = float(os.environ.get("PLAYER1_CPU_SECONDS", "9"))
 NEARBY_RADIUS = c.MAX_FACE_LENGTH / 2  # what counts as "around" an initial solution
 CONVERGENCE_STEP_NUM = 50  # stop after this many steps without a gain above MIN_GAIN
 MIN_GAIN = 1.0  # score improvement that counts as progress
@@ -143,7 +144,15 @@ def pick_pieces(
 ) -> tuple[Piece, ...] | None:
     """Pieces in stock adding up to exactly `length`, exactly `gate_count` of
     them gates, or None. Largest pieces first, so few STRAIGHTs are spent.
-    An empty tuple for length 0."""
+    An empty tuple for length 0. Cached: the same question comes up for many
+    candidates in every step."""
+    stock = (tuple(inventory.walls.items()), tuple(inventory.gates.items()))
+    return _pick_pieces(length, gate_count, *stock)
+
+
+@functools.cache
+def _pick_pieces(length: int, gate_count: int, walls, gates):
+    inventory = Inventory(walls=dict(walls), gates=dict(gates))
     if length == 0:
         return () if gate_count == 0 else None
     if not c.MIN_WALL_LENGTH <= length <= c.MAX_FACE_LENGTH:
@@ -357,30 +366,53 @@ def open_floor_around(loop: Loop, room: Room) -> float:
     return room.polygon.intersection(nearby).area
 
 
-def initial_solutions(shape: Loop, room: Room, inventory: Inventory) -> list[Loop]:
+def initial_solutions(
+    shape: Loop, room: "PreparedRoom", inventory: Inventory, deadline: float
+) -> list[Loop]:
     """
-    Place the initialized rectangle at different valid positions as starting points for local search, specifically:
-    Rank and choose the placements that have more open area surrounded / can potentially reach more area if search from it,
-    and are at least NEARBY_RADIUS apart from each other."""
+    Place the initialized rectangle anywhere in the room as starting points for local search:
+    centred on a grid of points across the room (one minimum wall length apart), and with a
+    corner on each room corner (which reaches narrow spots the grid misses), turned to line
+    up with each room wall. Rank and choose the placements that have more open area
+    around them / can potentially reach more area if searched from, and that are at least
+    one minimum wall length apart from each other."""
     ring = list(room.polygon.exterior.coords)
     wall_directions = {
         round(math.degrees(math.atan2(y2 - y1, x2 - x1)) % 90, 6) + quarter
-        for (x1, y1), (x2, y2) in zip(ring, ring[1:])
+        for (x1, y1), (x2, y2) in itertools.pairwise(ring)
         for quarter in (0, 90, 180, 270)
     }
+    min_x, min_y, max_x, max_y = room.polygon.bounds
+    step = c.MIN_WALL_LENGTH
+    centres = [
+        (min_x + i * step, min_y + j * step)
+        for i in range(int((max_x - min_x) / step) + 1)
+        for j in range(int((max_y - min_y) / step) + 1)
+    ]
     placed = []
     for rotation in wall_directions:
+        if time.process_time() >= deadline:
+            break  # a room with very many wall directions: keep what we have
         rotated = Loop((0.0, 0.0), rotation, shape.faces)
         shape_corners = build_geometry(to_construction(rotated))[0]
-        for room_x, room_y in ring[:-1]:
-            for shape_x, shape_y in shape_corners:
-                loop = Loop((room_x - shape_x, room_y - shape_y), rotation, shape.faces)
-                if validate_construction(to_construction(loop), room, inventory).valid:
-                    placed.append(loop)
-    placed.sort(key=lambda loop: open_floor_around(loop, room), reverse=True)
+        middle_x = sum(x for x, _ in shape_corners) / len(shape_corners)
+        middle_y = sum(y for _, y in shape_corners) / len(shape_corners)
+        starts = [(x - middle_x, y - middle_y) for x, y in centres]
+        starts += [(x - sx, y - sy) for x, y in ring[:-1] for sx, sy in shape_corners]
+        # cheap first: every corner inside the room, tested for all starts at once
+        xs = [x + sx for x, _ in starts for sx, _ in shape_corners]
+        ys = [y + sy for _, y in starts for _, sy in shape_corners]
+        inside = shapely.contains_xy(room.floor, xs, ys).reshape(len(starts), -1)
+        for start in (start for start, ok in zip(starts, inside.all(axis=1)) if ok):
+            loop = Loop(start, rotation, shape.faces)
+            if validate_construction(to_construction(loop), room, inventory).valid:
+                placed.append((open_floor_around(loop, room), loop))
+    placed.sort(key=lambda placement: placement[0], reverse=True)
     chosen: list[Loop] = []
-    for loop in placed:
-        if all(math.dist(loop.start, o.start) >= NEARBY_RADIUS for o in chosen):
+    for _, loop in placed:
+        if chosen and time.process_time() >= deadline:
+            break
+        if all(math.dist(loop.start, o.start) >= c.MIN_WALL_LENGTH for o in chosen):
             chosen.append(loop)
     return chosen
 
@@ -388,19 +420,42 @@ def initial_solutions(shape: Loop, room: Room, inventory: Inventory) -> list[Loo
 # ------------------------------------------------------------------- search
 
 
+class PreparedRoom(Room):
+    """The room with the simulator's tolerance buffer built once. The
+    simulator's contains_enclosure rebuilds it on every call, which is slow
+    for rooms with many corners; the answer is the same."""
+
+    def __init__(self, room: Room):
+        super().__init__(room.polygon)
+        self.floor = room.polygon.buffer(c.TOL)
+        shapely.prepare(self.floor)
+
+    def contains_enclosure(self, enclosure_polygon, tol: float = c.TOL) -> bool:
+        return self.floor.contains(enclosure_polygon)
+
+
 class Player1(Player):
     """Group 1: softmax local search from rectangles, closure kept by construction."""
 
+    def __init__(self, room, inventory, weights) -> None:
+        super().__init__(PreparedRoom(room), inventory, weights)
+
     def evaluate(self, loop: Loop) -> float | None:
-        """The simulator's score for `loop`, or None if it would be invalid."""
-        result = validate_construction(to_construction(loop), self.room, self.inventory)
+        """The simulator's score for `loop`, or None if it would be invalid.
+        A loop with a corner outside the room is pruned before the (much
+        slower) full validation, which would reject it anyway."""
+        construction = to_construction(loop)
+        xs, ys = zip(*build_geometry(construction)[0])
+        if not shapely.contains_xy(self.room.floor, xs, ys).all():
+            return None
+        result = validate_construction(construction, self.room, self.inventory)
         return score_construction(result, self.weights) if result.valid else None
 
-    def grow_to_largest(self, loop: Loop) -> Loop:
+    def grow_to_largest(self, loop: Loop, deadline: float) -> Loop:
         """`loop` resized greedily, best-scoring resize first, until no resize
         scores higher: the largest rectangle (by score) in that spot."""
         score = self.evaluate(loop)
-        while True:
+        while time.process_time() < deadline:
             better = [
                 (resized_score, resized)
                 for resized in resize_face(loop, self.inventory)
@@ -410,6 +465,7 @@ class Player1(Player):
             if not better:
                 return loop
             score, loop = max(better, key=lambda pair: pair[0])
+        return loop
 
     def local_search(
         self, start: Loop, cpu_seconds: float, random_state: random.Random
@@ -447,24 +503,34 @@ class Player1(Player):
         return best, best_score
 
     def build_enclosure(self) -> Construction | None:
+        deadline = time.process_time() + CPU_SECONDS  # covers placing and growing too
         # Start with a valid rectangle and place it at different places in the room as possible start points for local search
         shape = smallest_rectangle(self.inventory)
         placements = (
-            initial_solutions(shape, self.room, self.inventory) if shape else []
+            initial_solutions(shape, self.room, self.inventory, deadline)
+            if shape
+            else []
         )
         if not placements:
             self.note = "no rectangle fits: nothing built"
             return None
 
         # For each rectangle at different places, increase its size by as much as possible and run local search from there, returning the best result
-        starts = list(dict.fromkeys(map(self.grow_to_largest, placements)))
         random_state = random.Random(0)
-        deadline = time.process_time() + CPU_SECONDS
         results = []
-        for i, start in enumerate(starts):
-            # an equal share of the time left, so an early stop benefits the rest
-            share = (deadline - time.process_time()) / (len(starts) - i)
-            results.append(self.local_search(start, share, random_state))
+        for placement in placements:
+            if results and time.process_time() >= deadline:
+                break  # out of time; the first start is always searched
+            # best-first: the most open spots first, each searched until it converges
+            stop = deadline
+            start = self.grow_to_largest(placement, stop)
+            results.append(
+                self.local_search(start, stop - time.process_time(), random_state)
+            )
         best, score = max(results, key=lambda result: result[1])
-        self.note = f"{len(starts)} initial solutions; best {score:.0f} ({len(best.faces)} faces)"
+        self.note = f"{len(placements)} initial solutions; best {score:.0f} ({len(best.faces)} faces)"
+        # A: an enclosure that scores below zero is worse than none at all
+        if score <= 0:
+            self.note += " -- below zero, so nothing is built"
+            return None
         return to_construction(best)

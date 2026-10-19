@@ -17,20 +17,23 @@ RECTANGLE = "rectangle"
 OCTAGON = "octagon"
 L_SHAPE = "L"
 U_SHAPE = "U"
+HEXAGON = "hexagon"
+FREE = "free-form"
 
-# how many corner connectors of which type each family needs
+# how many corner connectors of each type a family needs
 CORNERS_NEEDED = {
-    RECTANGLE: (ConnectorType.RIGHT, 4),
-    OCTAGON: (ConnectorType.DIAGONAL, 8),
-    L_SHAPE: (ConnectorType.RIGHT, 6),
-    U_SHAPE: (ConnectorType.RIGHT, 8),
+    RECTANGLE: {ConnectorType.RIGHT: 4},
+    OCTAGON: {ConnectorType.DIAGONAL: 8},
+    L_SHAPE: {ConnectorType.RIGHT: 6},
+    U_SHAPE: {ConnectorType.RIGHT: 8},
+    HEXAGON: {ConnectorType.RIGHT: 2, ConnectorType.DIAGONAL: 4},
 }
 
 # a shape looks the same again after turning this far, so placements only need
 # to try headings below it (an L has no such symmetry)
-SYMMETRY_DEG = {RECTANGLE: 180, OCTAGON: 180, L_SHAPE: 360, U_SHAPE: 360}
+SYMMETRY_DEG = {RECTANGLE: 180, OCTAGON: 180, L_SHAPE: 360, U_SHAPE: 360, HEXAGON: 180}
 # the step between the headings worth trying, relative to a room edge
-HEADING_STEP_DEG = {RECTANGLE: 90, OCTAGON: 45, L_SHAPE: 90, U_SHAPE: 90}
+HEADING_STEP_DEG = {RECTANGLE: 90, OCTAGON: 45, L_SHAPE: 90, U_SHAPE: 90, HEXAGON: 45}
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,10 @@ class Shape:
         return points
 
     def describe(self) -> str:
+        if self.family == FREE:
+            return f"{FREE}, {len(self.faces)} faces"
+        if self.family == "polish":
+            return f"polish, {len(self.faces)} faces"
         return f"{self.family} {'x'.join(str(p) for p in self.params)}"
 
 
@@ -86,11 +93,19 @@ def u_measures(left: int, gap: int, right: int, height: int, leg: int) -> tuple:
     return float(width * height - gap * leg), 2.0 * (width + height + leg)
 
 
+def hexagon_measures(a: int, d1: int, d2: int) -> tuple[float, float]:
+    """A hexagon walked east a, north-east d1, north-west d2, and back: a d1 by d2
+    rectangle standing on its corner, stretched sideways by a. It needs only two
+    right-angle connectors, with four diagonal ones."""
+    return d1 * d2 + a * (d1 + d2) / SQRT2, 2.0 * (a + d1 + d2)
+
+
 MEASURES = {
     RECTANGLE: rectangle_measures,
     OCTAGON: octagon_measures,
     L_SHAPE: l_measures,
     U_SHAPE: u_measures,
+    HEXAGON: hexagon_measures,
 }
 
 
@@ -106,11 +121,36 @@ def make_shape(family: str, params: tuple[int, ...]) -> Shape:
         a, b, c, d = params
         faces = (a, b, c, d, a - c, b + d)
         turns = (90.0, 90.0, 90.0, -90.0, 90.0, 90.0)
+    elif family == HEXAGON:
+        a, d1, d2 = params
+        faces = (a, d1, d2, a, d1, d2)
+        turns = (45.0, 45.0, 90.0, 45.0, 45.0, 90.0)
     else:
         left, gap, right, height, leg = params
         faces = (left + gap + right, height, right, leg, gap, leg, left, height)
         turns = (90.0, 90.0, 90.0, 90.0, -90.0, -90.0, 90.0, 90.0)
     return Shape(family, params, faces, turns, area, perimeter)
+
+
+def free_shape(headed_faces: tuple[tuple[int, int], ...]) -> Shape:
+    """A shape from faces given as (heading in 45-degree steps, length)."""
+    lengths = tuple(length for _, length in headed_faces)
+    headings = [h for h, _ in headed_faces]
+    turns = tuple(
+        ((h - headings[i - 1] + 3) % 8 - 3) * 45.0 for i, h in enumerate(headings)
+    )
+    return Shape(FREE, lengths, lengths, turns, 0.0, float(sum(lengths)))
+
+
+def headed_faces(shape: Shape) -> tuple[tuple[int, int], ...]:
+    """A shape's faces as (heading in 45-degree steps from face 0, length)."""
+    out = []
+    heading = 0
+    for i, length in enumerate(shape.faces):
+        if i:
+            heading = (heading + round(shape.turns[i] / 45.0)) % 8
+        out.append((heading, length))
+    return tuple(out)
 
 
 def contains_smaller(family: str, big: tuple[int, ...], small: tuple[int, ...]) -> bool:
@@ -127,6 +167,9 @@ def contains_smaller(family: str, big: tuple[int, ...], small: tuple[int, ...]) 
         )
     if family == U_SHAPE:
         return False  # no simple rule; every U is tried
+    if family == HEXAGON:
+        # a sum of three segments, like the octagon
+        return all(b >= s for b, s in zip(big, small))
     a, b, c, d = big
     sa, sb, sc, sd = small
     return a >= sa and b + d >= sb + sd and a - c >= sa - sc and b >= sb
@@ -158,4 +201,7 @@ def inner_radius(family: str, params: tuple[int, ...]) -> float:
             t + (p + q) / SQRT2,
         )
         return min(widths) / 2.0
+    if family == HEXAGON:
+        a, d1, d2 = params
+        return min((d1 + d2) / SQRT2, a / SQRT2 + d1, a / SQRT2 + d2) / 2.0
     return max(min(rect) for rect in inner_rectangles(family, params)) / 2.0

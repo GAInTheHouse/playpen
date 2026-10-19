@@ -23,6 +23,23 @@ from src.scenario import Scenario, generate_scenario, read_scenario, write_scena
 # resize; the result panel is wiped and redrawn on every click.
 ENCLOSURE_TAG = "enclosure"
 STATIC_TAG = "static"
+
+
+def player_label(name: str | None) -> str:
+    """What to call the selected player on screen: "Player 3" for a group's."""
+    if name is None:
+        return "No player (sandbox)"
+    if name.isdigit():
+        return f"Player {name}"
+    if name == "e":
+        return "Example player"
+    if name == "i":
+        return "Invalid-examples demo"
+    if name.startswith("i") and name[1:].isdigit():
+        return f"Invalid example {name[1:]}"
+    return name
+
+
 RESULT_TAG = "result"
 
 TOOLTIP_TAG = "tooltip"
@@ -125,7 +142,7 @@ class Game:
     def _build_gui(self):
         self.root = tk.Tk()
         self.root.withdraw()  # stay hidden until fully built and drawn
-        self.root.title("Playpen")
+        self.root.title(f"Playpen - {player_label(self.args.player)}")
 
         # The info panel is packed FIRST. Tk's pack gives space to widgets in
         # the order they were packed, so if the window ever ends up smaller
@@ -785,7 +802,18 @@ class Game:
     def _draw_static_info_panel(self):
         self._tag = STATIC_TAG
         y = 16
+        top = y
         y = self._put(y, "Playpen", ("Arial", c.TITLE_FONT_SIZE, "bold"), c.TEXT_COLOR)
+        self.info.create_text(
+            PANEL_MARGIN + self._panel_width(),
+            (top + y) / 2,
+            text=player_label(self.args.player),
+            anchor="e",
+            width=self._panel_width() - 120,
+            font=("Arial", c.FONT_SIZE, "bold"),
+            fill=c.SECTION_HEADER_COLOR,
+            tags=STATIC_TAG,
+        )
         y = self._divider(y)
 
         room = self.scenario.room
