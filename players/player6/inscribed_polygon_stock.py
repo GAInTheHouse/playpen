@@ -203,16 +203,26 @@ def _dfs(ctx, k, node_limit, piece_cap=None, stop=None):
 
 
 def assign_inventory(
-    runs, walls, gates, angle_stock=None, *, stop=None, node_limit=200_000
+    runs,
+    walls,
+    gates,
+    angle_stock=None,
+    *,
+    stop=None,
+    node_limit=200_000,
+    min_gate_faces=1,
+    prefer_two=True,
 ):
     """Assign typed (0=gate, 1=wall) pieces, preferring two actual gate faces.
 
     A one-gate feasible plan is retained if the optional bonus search times out.
     Counts of equal-length walls and gates remain independent throughout DFS.
+    min_gate_faces=0 allows spare, ungated faces for an already gated seed;
+    prefer_two=False disables the optional second-gate assignment search.
     """
     stock = {(1, length): n for length, n in clean_stock(walls).items()}
     stock.update({(0, length): n for length, n in clean_stock(gates).items()})
-    if not any(kind == 0 for kind, _ in stock) or not len(runs):
+    if (min_gate_faces and not any(kind == 0 for kind, _ in stock)) or not len(runs):
         return None
     angles = clean_angle_stock(angle_stock)
     if len(runs) > angles.get("right", len(runs)):
@@ -273,8 +283,8 @@ def assign_inventory(
         "suffix_minp": suffix_minp,
         "cls_idx": [i for i, key in enumerate(keys) if key[0] == 0],
     }
-    plan = _dfs(ctx, 1, node_limit, cap, stop=stop)
-    if plan is not None and sum(clean_stock(gates).values()) >= 2:
+    plan = _dfs(ctx, min_gate_faces, node_limit, cap, stop=stop)
+    if prefer_two and plan is not None and sum(clean_stock(gates).values()) >= 2:
         try:
             bonus_plan = _dfs(ctx, 2, node_limit, cap, stop=stop)
         except ip.SearchStopped:

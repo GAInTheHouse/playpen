@@ -7,19 +7,21 @@ from shapely import Polygon
 
 from players.player0 import Player
 from players.player6.diagonal_search import DiagonalSearch
+from players.player6.local_search import Local45Search, LocalSearchStats
 from players.player6.polygon import find_fit
 from src.enclosure import Construction, score_construction, validate_construction
 from src.pieces import Connector, ConnectorType, Piece, PieceType
 
 
 class Player6(Player):
-    """Group 6: <one line on your strategy -- fill this in>."""
+    """Group 6: inventory-aware grid/beam search with local 45-degree refinement."""
 
     GATE = 0
     WALL = 1
     SEARCH_SECONDS = 45.0
     DIAGONAL_SECONDS = 20.0
     INSCRIBED_SECONDS = 20.0
+    LOCAL_SECONDS = 2.0
     STEPS = (
         (1, 0),
         (0, 1),
@@ -677,6 +679,37 @@ class Player6(Player):
             evaluate=self._consider_inscribed,
         )
 
+    def _improve_local(self, deadline):
+        budget = min(
+            self.LOCAL_SECONDS - self.local_stats.cpu_seconds,
+            deadline - time.process_time(),
+        )
+        if (
+            self.best_construction is None
+            or budget <= 0
+            or self.inventory.connectors.get(ConnectorType.DIAGONAL, 0) < 4
+        ):
+            return
+        search = Local45Search(
+            self.room,
+            self.inventory,
+            self.weights,
+            time_budget=budget,
+            stop=lambda: time.process_time() >= deadline,
+        )
+        candidate = search.improve(self.best_construction)
+        for name, value in vars(search.stats).items():
+            setattr(self.local_stats, name, getattr(self.local_stats, name) + value)
+        if candidate is not None:
+            result = validate_construction(candidate, self.room, self.inventory)
+            if result.valid:
+                score = score_construction(result, self.weights)
+                if score > self.best_score:
+                    self.best_score = score
+                    self.best_construction = candidate
+                    self.best_shape = None
+                    self.best_fit = None
+
     def build_enclosure(self) -> Construction | None:
         # Set up for you by Player.__init__:
         #   self.room       the room footprint (self.room.polygon is a shapely Polygon;
@@ -712,6 +745,7 @@ class Player6(Player):
         self.best_fit = None
         self.best_score = 0
         self.best_construction = None
+        self.local_stats = LocalSearchStats()
 
         self.possible_faces = {}
         if not self.inventory.has_gate():
@@ -721,6 +755,8 @@ class Player6(Player):
 
         self.generate_quads()
         self.generate_quad_shapes()
+        # Use only spare orthogonal-stage time, preserving the beam budget.
+        self._improve_local(self._deadline)
 
         # Keep the rectangle/L result as a fallback. Spend only the reserved
         # time on the other branch's exact 45-degree beam search.
@@ -741,4 +777,7 @@ class Player6(Player):
                         self.best_score = score
                         self.best_construction = diagonal
 
+        # A later beam result may have a useful local move too. Both calls
+        # share LOCAL_SECONDS and remain within the same overall deadline.
+        self._improve_local(overall_deadline)
         return self.best_construction
