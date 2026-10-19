@@ -10,16 +10,11 @@ from .prev_deliverable import Player3 as PreviousPlayer3
 
 
 class Player3(PreviousPlayer3):
-    SEED_FRACTION = 0.4
-
     def build_enclosure(self):
         begun = time.process_time()
         deadline = begun + self.SEARCH_SECONDS
         seed_player = PreviousPlayer3(self.room, self.inventory, self.weights)
-        seed_player.SEARCH_SECONDS = max(0.01, self.SEARCH_SECONDS * self.SEED_FRACTION)
-        seed_player.RECTANGLE_SECONDS = min(
-            self.RECTANGLE_SECONDS, seed_player.SEARCH_SECONDS * 0.2
-        )
+        seed_player.SEARCH_DEADLINE = deadline
         seed_player.BEAM_WIDTH = self.BEAM_WIDTH
         seed_player.MAX_FACES = self.MAX_FACES
         seed_player.USE_BEAM = self.USE_BEAM
