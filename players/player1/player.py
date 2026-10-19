@@ -1,10 +1,9 @@
 """Group 1: local search over a closed loop of straight faces.
 
-Place the smallest rectangle the stock can build (or, with too few
-right-angle connectors, the smallest hexagon) around the room, most open
-spots first. Grow each greedily, then run a softmax local search
-until it converges or time runs out. Return the best loop, with a second gate
-added if one fits.
+At each spot in the room, place the highest-scoring rectangle or hexagon the
+stock can build that fits there. Taking the spots best first, grow each
+greedily, then run a softmax local search until it converges or time runs
+out. Return the best loop, with a second gate added if one fits.
 """
 
 import functools
@@ -33,13 +32,15 @@ from src.inventory import Inventory
 from src.pieces import Connector, ConnectorType, Piece, PieceType
 from src.room import Room
 
-# the only setting: total CPU time per room, kept under 10 s (a search step can
-# run a little past it); set PLAYER1_CPU_SECONDS in the environment to override
+# total CPU time per room, kept under 10 s (a search step can run a little past
+# it); set PLAYER1_CPU_SECONDS in the environment to override
 CPU_SECONDS = float(os.environ.get("PLAYER1_CPU_SECONDS", "9"))
-NEARBY_RADIUS = c.MAX_FACE_LENGTH / 2  # what counts as "around" an initial solution
 CONVERGENCE_STEP_NUM = 50  # stop after this many steps without a gain above MIN_GAIN
 MIN_GAIN = 1.0  # score improvement that counts as progress
 MAX_STARTS = 40  # placements kept, more than the search ever reaches
+FIT_RECTANGLES = 12  # rectangle sizes tried, highest estimated score first
+FIT_HEXAGONS = 8  # hexagon sizes tried, highest estimated score first
+FIT_SHARE = 0.3  # of the time, at most, spent fitting shapes to spots
 
 CONNECTOR_FOR_TURN = {  # turn in degrees -> connector
     90: Connector(ConnectorType.RIGHT),
@@ -414,18 +415,70 @@ def smallest_hexagon(inventory: Inventory) -> Loop | None:
     """
     lengths = range(c.MIN_WALL_LENGTH, c.MAX_FACE_LENGTH + 1)
     for a, b, d in sorted(itertools.product(lengths, repeat=3), key=sum):
-        sides = [(0, a), (45, d), (90, b), (180, a), (225, d), (270, b)]
-        for gate in range(len(sides)):
-            specs = [
-                FaceSpec(direction, length, int(i == gate))
-                for i, (direction, length) in enumerate(sides)
-            ]
-            faces = build_faces(specs, inventory)
-            if faces and len(faces) == len(sides):
-                shape = Loop((0.0, 0.0), 0.0, tuple(faces))
-                if buildable(shape, inventory):
-                    return shape
+        shape = shape_with_gate(hexagon_sides(a, b, d), inventory)
+        if shape:
+            return shape
     return None
+
+
+def hexagon_sides(a: int, b: int, d: int) -> list[tuple[int, int]]:
+    return [(0, a), (45, d), (90, b), (180, a), (225, d), (270, b)]
+
+
+def shape_with_gate(sides, inventory: Inventory) -> Loop | None:
+    """The loop with these [(direction, length)] sides, its gate on whichever
+    side takes one, at the origin, if the stock builds it."""
+    for gate in range(len(sides)):
+        specs = [
+            FaceSpec(direction, length, int(i == gate))
+            for i, (direction, length) in enumerate(sides)
+        ]
+        faces = build_faces(specs, inventory)
+        if faces and len(faces) == len(sides):
+            shape = Loop((0.0, 0.0), 0.0, tuple(faces))
+            if buildable(shape, inventory):
+                return shape
+    return None
+
+
+def best_shapes(inventory: Inventory, weights, deadline: float) -> list:
+    """(estimated score, shape) for the FIT_RECTANGLES rectangles and
+    FIT_HEXAGONS hexagons the stock builds with the highest estimated score,
+    1000 + A * area + C * perimeter."""
+    lengths = range(c.MIN_WALL_LENGTH, c.MAX_FACE_LENGTH + 1)
+    right = inventory.connectors.get(ConnectorType.RIGHT, 0)
+    diagonal = inventory.connectors.get(ConnectorType.DIAGONAL, 0)
+    families = []
+    if right >= 4:
+        rectangles = [
+            (
+                weights.A * a * b + weights.C * 2 * (a + b),
+                [(0, a), (90, b), (180, a), (270, b)],
+            )
+            for a in lengths
+            for b in lengths
+            if a >= b
+        ]
+        families.append((rectangles, FIT_RECTANGLES))
+    if right >= 2 and diagonal >= 4:
+        hexagons = []
+        for a, b, d in itertools.product(lengths, repeat=3):
+            cut = d / math.sqrt(2)
+            area = (a + cut) * (b + cut) - cut * cut
+            estimate = weights.A * area + weights.C * 2 * (a + b + d)
+            hexagons.append((estimate, hexagon_sides(a, b, d)))
+        families.append((hexagons, FIT_HEXAGONS))
+    found = []
+    for candidates, wanted in families:
+        kept = 0
+        for estimate, sides in sorted(candidates, key=lambda e: -e[0]):
+            if kept == wanted or time.process_time() >= deadline:
+                break
+            shape = shape_with_gate(sides, inventory)
+            if shape:
+                found.append((1000 + estimate, shape))
+                kept += 1
+    return found
 
 
 def starting_shape(inventory: Inventory) -> Loop | None:
@@ -484,30 +537,22 @@ def placements_at(shape: Loop, rotation: float, room: PreparedRoom) -> list:
     ]
 
 
-def open_floor(centres, room: Room) -> dict:
-    """Floor area within NEARBY_RADIUS of each centre, to the nearest unit:
-    more in an open part of the room than in a narrow passage."""
-    centres = sorted(set(centres))
-    nearby = shapely.buffer(shapely.points(centres), NEARBY_RADIUS)
-    areas = shapely.area(shapely.intersection(room.polygon, nearby))
-    return dict(zip(centres, np.round(areas)))
-
-
-def initial_solutions(shape: Loop, room: PreparedRoom, deadline: float) -> list[Loop]:
-    """Placements of `shape`, most open floor first, centres spaced apart,
-    at most MAX_STARTS of them."""
-    placed = []
-    for rotation in sorted(room_rotations(room, shape)):
-        if placed and time.process_time() >= deadline:
-            break  # a room with very many wall directions: keep what we have
-        placed += placements_at(shape, rotation, room)
-    if not placed:
-        return []
-    floor = open_floor((middle for middle, _ in placed), room)
-    placed.sort(key=lambda placement: floor[placement[0]], reverse=True)
+def initial_solutions(shapes, room: PreparedRoom, deadline: float) -> list[Loop]:
+    """At each spot, the shape in `shapes` [(estimated score, shape)] with
+    the highest estimated score that fits there; spots best first, centres
+    spaced apart, at most MAX_STARTS of them."""
+    best: dict = {}  # spot -> (estimated score, placement)
+    for estimate, shape in shapes:
+        for rotation in sorted(room_rotations(room, shape)):
+            if best and time.process_time() >= deadline:
+                break  # out of time: keep what fits so far
+            for middle, loop in placements_at(shape, rotation, room):
+                if middle not in best or best[middle][0] < estimate:
+                    best[middle] = (estimate, loop)
+    ranked = sorted(best.items(), key=lambda item: -item[1][0])
     chosen: list[Loop] = []
     centres: dict[tuple[int, int], list] = {}  # chosen centres, by 5x5 square
-    for middle, loop in placed:
+    for middle, (_, loop) in ranked:
         if len(chosen) == MAX_STARTS:
             break
         i, j = (int(v // c.MIN_WALL_LENGTH) for v in middle)
@@ -598,9 +643,17 @@ class Player1(Player):
         return best
 
     def build_enclosure(self) -> Construction | None:
-        deadline = time.process_time() + CPU_SECONDS  # covers placing and growing too
-        shape = starting_shape(self.inventory)
-        placements = initial_solutions(shape, self.room, deadline) if shape else []
+        now = time.process_time()
+        deadline = now + CPU_SECONDS  # covers placing and growing too
+        fit_until = now + FIT_SHARE * CPU_SECONDS
+        shapes = best_shapes(self.inventory, self.weights, fit_until)
+        smallest = starting_shape(self.inventory)
+        if smallest:  # so that every spot that fits anything gets a shape
+            result = validate_construction(
+                to_construction(smallest), ANYWHERE, self.inventory
+            )
+            shapes = [(score_construction(result, self.weights), smallest), *shapes]
+        placements = initial_solutions(shapes, self.room, fit_until)
 
         random_state = random.Random(0)
         results = []
