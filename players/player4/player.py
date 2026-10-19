@@ -1,10 +1,16 @@
 import math
+import os
 import time
 
 import shapely
 from shapely.geometry.polygon import orient
 
 from players.player0 import Player
+from players.player4.anchors_extra import (
+    anchors_from_construction,
+    interior_anchors,
+    wall_heading_offset_anchors,
+)
 from players.player4.faces import FaceCatalog
 from players.player4.search import Anchor, BeamSearch, Closed, connector_for
 from src.constants import TOL
@@ -18,6 +24,9 @@ SEARCH_SECONDS = 40.0
 BEAM_WIDTHS = (40, 500)
 MAX_FACES = 14
 EDGE_FRACTIONS = (0.25, 0.5)
+TOP_WIDE_ANCHORS = 12
+# baseline | interior_after | wall45_pass | topk_wide | restart (default: full-suite winner)
+ANCHOR_STRATEGY = os.environ.get("PLAYER4_ANCHOR_STRATEGY", "restart")
 
 
 class Player4(Player):
@@ -44,18 +53,135 @@ class Player4(Player):
 
         begin = time.process_time()
         budget_end = begin + SEARCH_SECONDS
-        anchors = room_anchors(self.room.polygon)
-        best, best_score = None, 0.0
-        for width in BEAM_WIDTHS:
+        strategy = os.environ.get("PLAYER4_ANCHOR_STRATEGY", ANCHOR_STRATEGY)
+        walls = room_anchors(self.room.polygon)
+
+        if strategy == "interior_after":
+            best, best_score = self._search_phases(
+                room,
+                catalog,
+                connectors,
+                walls + interior_anchors(self.room.polygon),
+                budget_end,
+                BEAM_WIDTHS,
+            )
+        elif strategy == "wall45_pass":
+            best, best_score = self._search_phases(
+                room,
+                catalog,
+                connectors,
+                walls,
+                budget_end,
+                BEAM_WIDTHS,
+            )
+            if time.process_time() < budget_end:
+                best, best_score = self._search_phases(
+                    room,
+                    catalog,
+                    connectors,
+                    wall_heading_offset_anchors(walls),
+                    budget_end,
+                    (500,),
+                    best,
+                    best_score,
+                )
+        elif strategy == "topk_wide":
+            best, best_score, ranked = self._search_phases(
+                room,
+                catalog,
+                connectors,
+                walls,
+                budget_end,
+                (40,),
+                track_anchor_scores=True,
+            )
+            if time.process_time() < budget_end and ranked:
+                ranked.sort(key=lambda r: -r[1])
+                top = [walls[i] for i, _ in ranked[:TOP_WIDE_ANCHORS]]
+                best, best_score = self._search_phases(
+                    room,
+                    catalog,
+                    connectors,
+                    top,
+                    budget_end,
+                    (500,),
+                    best,
+                    best_score,
+                )
+        elif strategy == "restart":
+            best, best_score = self._search_phases(
+                room,
+                catalog,
+                connectors,
+                walls,
+                budget_end,
+                BEAM_WIDTHS,
+            )
+            if best is not None and time.process_time() < budget_end:
+                restarts = anchors_from_construction(best)
+                best, best_score = self._search_phases(
+                    room,
+                    catalog,
+                    connectors,
+                    restarts,
+                    budget_end,
+                    (500,),
+                    best,
+                    best_score,
+                )
+        else:
+            best, best_score = self._search_phases(
+                room,
+                catalog,
+                connectors,
+                walls,
+                budget_end,
+                BEAM_WIDTHS,
+            )
+
+        if best is None:
+            self.note = "Beam search found no valid enclosure with a positive score"
+            return None
+        self.note = (
+            f"Beam search ({strategy}): best score {best_score:.1f} from "
+            f"{len(best.pieces)} pieces ({time.process_time() - begin:.1f}s CPU)"
+        )
+        return best
+
+    def _search_phases(
+        self,
+        room,
+        catalog: FaceCatalog,
+        connectors: tuple[int, int, int],
+        anchors: list[Anchor],
+        budget_end: float,
+        beam_widths: tuple[int, ...],
+        best: Construction | None = None,
+        best_score: float = 0.0,
+        track_anchor_scores: bool = False,
+    ) -> (
+        tuple[Construction | None, float]
+        | tuple[Construction | None, float, list[tuple[int, float]]]
+    ):
+        per_anchor: list[tuple[int, float]] = []
+        for width in beam_widths:
             for k, anchor in enumerate(anchors):
                 now = time.process_time()
                 if now >= budget_end:
                     break
-                deadline = now + (budget_end - now) / (len(anchors) - k)
+                remaining = len(anchors) - k
+                deadline = now + (budget_end - now) / remaining if remaining else now
+                anchor_best = 0.0
                 search = BeamSearch(
-                    anchor, catalog, connectors, self.weights, room,
-                    width, MAX_FACES, deadline,
-                )  # fmt: skip
+                    anchor,
+                    catalog,
+                    connectors,
+                    self.weights,
+                    room,
+                    width,
+                    MAX_FACES,
+                    deadline,
+                )
                 try:
                     candidates = search.run()
                 except Exception:
@@ -68,18 +194,17 @@ class Player4(Player):
                         construction, self.room, self.inventory
                     )
                     if result.valid:
-                        best = construction
-                        best_score = score_construction(result, self.weights)
+                        score = score_construction(result, self.weights)
+                        anchor_best = max(anchor_best, score)
+                        if score > best_score:
+                            best = construction
+                            best_score = score
                         break
-
-        if best is None:
-            self.note = "Beam search found no valid enclosure with a positive score"
-            return None
-        self.note = (
-            f"Beam search: best score {best_score:.1f} from {len(best.pieces)} pieces"
-            f" ({time.process_time() - begin:.1f}s CPU)"
-        )
-        return best
+                if track_anchor_scores and anchor_best > 0:
+                    per_anchor.append((k, anchor_best))
+        if track_anchor_scores:
+            return best, best_score, per_anchor
+        return best, best_score
 
 
 def room_anchors(polygon) -> list[Anchor]:
