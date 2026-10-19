@@ -1,9 +1,40 @@
+import math
+from itertools import pairwise
 from time import process_time
 
 from shapely import affinity, constrained_delaunay_triangles
 from shapely.geometry import MultiPoint, Polygon, box
 from shapely.ops import unary_union
 from shapely.prepared import prep
+
+
+def room_search_angles(room, cluster_tolerance=3.0):
+    """Choose a length-weighted boundary axis and eight relative orientations."""
+    ring = list(room.exterior.coords)
+    directions = []
+    for (x0, y0), (x1, y1) in pairwise(ring):
+        length = math.hypot(x1 - x0, y1 - y0)
+        if length > 0:
+            # Opposite and perpendicular walls describe the same orthogonal axis.
+            angle = math.degrees(math.atan2(y1 - y0, x1 - x0)) % 90
+            directions.append((angle, length))
+
+    def support(direction):
+        angle, length = direction
+        weight = sum(
+            other_length
+            for other_angle, other_length in directions
+            if min(abs(angle - other_angle), 90 - abs(angle - other_angle))
+            <= cluster_tolerance
+        )
+        return weight, length
+
+    # Use an actual boundary direction rather than rounding or averaging:
+    # a small angular error can rule out a tight corridor placement.
+    main_angle = max(directions, key=support)[0] if directions else 0.0
+    return [
+        (main_angle + offset) % 360 for offset in (0, 180, 90, 270, 45, 225, 135, 315)
+    ]
 
 
 def triangles(poly):
@@ -68,8 +99,13 @@ def place_at_angle(Q, P, theta_deg, eps=1e-9, obstacle_triangles=None):
     return placed, (theta_deg, t.x, t.y)
 
 
-def find_fit(Q, P, n_angles=360, tol=1e-7, max_cpu_seconds=2.0):
-    """Try cheap boundary alignments before a bounded inner-fit search.
+def find_fit(
+    Q, P, n_angles=8, tol=1e-7, max_cpu_seconds=2.0, *, angles=None, stop=None
+):
+    """Try at most eight room-oriented angles, with a bounded inner-fit search.
+
+    n_angles caps the number of orientations; it no longer defines a uniform
+    angular grid. This heuristic may miss fits outside the selected angles.
 
     The time budget is checked between geometry operations; a single native
     operation may exceed it. Returning None means no fit was found within
@@ -78,20 +114,31 @@ def find_fit(Q, P, n_angles=360, tol=1e-7, max_cpu_seconds=2.0):
     deadline = process_time() + max_cpu_seconds
     padded_room = Q.buffer(tol)
     prepared_room = prep(padded_room)
-    angles = [360.0 * k / n_angles for k in range(n_angles)]
-    cardinal_angles = [theta for theta in angles if theta % 90 == 0]
+    angles = (room_search_angles(Q) if angles is None else list(angles))[
+        : max(0, min(n_angles, 8))
+    ]
+    if not angles:
+        return None
 
     # Align each corner of the candidate's bounding box with room vertices.
     # This catches tight corridor placements without Minkowski sums.
-    for theta in cardinal_angles:
+    for theta in angles:
         rotated = affinity.rotate(P, theta, origin=(0, 0))
         px0, py0, px1, py1 = rotated.bounds
         qx0, qy0, qx1, qy1 = Q.bounds
         if px1 - px0 > qx1 - qx0 + tol or py1 - py0 > qy1 - qy0 + tol:
             continue
+        # Actual vertices also support aligning tilted shapes to tilted walls;
+        # axis-aligned bounding-box corners alone do not preserve that alignment.
+        anchors = list(
+            dict.fromkeys(
+                list(rotated.exterior.coords)[:-1]
+                + [(px0, py0), (px0, py1), (px1, py0), (px1, py1)]
+            )
+        )
         for qx, qy in Q.exterior.coords:
-            for px, py in ((px0, py0), (px0, py1), (px1, py0), (px1, py1)):
-                if process_time() >= deadline:
+            for px, py in anchors:
+                if process_time() >= deadline or (stop is not None and stop()):
                     return None
                 tx, ty = qx - px, qy - py
                 if (
@@ -105,17 +152,16 @@ def find_fit(Q, P, n_angles=360, tol=1e-7, max_cpu_seconds=2.0):
                 if prepared_room.covers(placed):
                     return placed, (theta, tx, ty)
 
-    if process_time() >= deadline:
+    if process_time() >= deadline or (stop is not None and stop()):
         return None
     qx0, qy0, qx1, qy1 = Q.bounds
     obstacles = box(qx0, qy0, qx1, qy1).difference(Q)
     obstacle_triangles = [
         t for g in getattr(obstacles, "geoms", [obstacles]) for t in triangles(g)
     ]
-    for k in range(n_angles):
-        if process_time() >= deadline:
+    for theta in angles:
+        if process_time() >= deadline or (stop is not None and stop()):
             return None
-        theta = 360.0 * k / n_angles
         res = place_at_angle(Q, P, theta, obstacle_triangles=obstacle_triangles)
         if res is None:
             continue

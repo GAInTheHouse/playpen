@@ -1,17 +1,8 @@
-"""Naive exhaustive search with a fixed first-gate pose and exactly one gate."""
+"""Bounded-width beam search with a fixed first-gate pose and one gate."""
 
 import math
-import multiprocessing
-import os
 import time
-from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, fields
-from functools import lru_cache
-
-try:
-    import resource
-except ImportError:  # Windows: search CPU is an estimate without child accounting.
-    resource = None
+from dataclasses import dataclass
 
 from shapely.geometry import LineString
 
@@ -23,8 +14,15 @@ from src.constants import (
     MIN_WALL_LENGTH,
     TOL,
 )
-from src.enclosure import Construction, score_construction, validate_construction
+from src.enclosure import (
+    Construction,
+    compute_faces,
+    score_construction,
+    validate_construction,
+)
 from src.pieces import Connector, ConnectorType, Piece, PieceType
+
+AREA_HEURISTIC_WEIGHT = 0.075
 
 
 @dataclass
@@ -41,56 +39,8 @@ class SearchStats:
     final_wall_prunes: int = 0
 
 
-@lru_cache(maxsize=8192)
-def _turn_completion_possible(turns, right, diagonal, straight, minimum, maximum):
-    """Exact connector-subset feasibility in units of 45 degrees.
-
-    A simple polygon has total turn +8 or -8. For r right connectors the
-    possible sums are -2r, -2r+4, ..., +2r. Diagonals contribute +/-1;
-    extra pairs can cancel, and straight connectors can fill unused joints.
-    """
-    if minimum > maximum:
-        return False
-    max_turn = 2 * min(right, maximum) + min(diagonal, max(0, maximum - right))
-    for target in (8 - turns, -8 - turns):
-        if abs(target) > max_turn or (diagonal == 0 and target % 2):
-            continue
-        for used_right in range(min(right, maximum) + 1):
-            # Closest attainable right-connector sum to the required turn.
-            positive = min(used_right, max(0, (target + 2 * used_right + 2) // 4))
-            residual = abs(target - (4 * positive - 2 * used_right))
-            used_diagonal = max(residual, minimum - used_right - straight, 0)
-            used_diagonal += (target - used_diagonal) % 2
-            if used_diagonal <= diagonal and used_right + used_diagonal <= maximum:
-                return True
-    return False
-
-
-class _DeadlineReached(Exception):
-    pass
-
-
-def _children_cpu_seconds():
-    if resource is None:
-        return None
-    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
-    return usage.ru_utime + usage.ru_stime
-
-
-def _run_partition(player, partition, partitions, deadline):
-    return player._search_partition(partition, partitions, deadline)
-
-
 class Player5(Player):
-    """Enumerate every wall/connector chain rooted at a fixed starting gate.
-
-    Defaults to centering the gate along the longest room edge.
-    Optional keyword arguments fix another pose or a particular gate length.
-    Workers explore disjoint first-wall branches. The default five-second
-    elapsed-time deadline is shared across workers, including process startup.
-    Return the best polygon found so far. Set workers=1, time_limit=None for
-    the unbounded exhaustive DFS.
-    """
+    """Search partial wall chains from a fixed starting gate using a beam."""
 
     def __init__(
         self,
@@ -102,10 +52,11 @@ class Player5(Player):
         start_heading=None,
         gate_length=None,
         workers=None,
-        time_limit=5.0,
+        time_limit=20.0,
         distance_pruning=True,
         turn_pruning=True,
         final_wall_pruning=True,
+        beam_width=2048,
     ):
         super().__init__(room, inventory, weights)
         corners = room.get_boundary_points()
@@ -113,10 +64,7 @@ class Player5(Player):
             zip(corners, corners[1:] + corners[:1]),
             key=lambda edge: math.dist(*edge),
         )
-        self.edge_midpoint = (
-            (edge_start[0] + edge_end[0]) / 2,
-            (edge_start[1] + edge_end[1]) / 2,
-        )
+        self.edge_start = tuple(edge_start)
         self.start = None if start is None else tuple(start)
         self.start_heading = (
             math.degrees(
@@ -131,11 +79,16 @@ class Player5(Player):
             not math.isfinite(time_limit) or time_limit <= 0
         ):
             raise ValueError("time_limit must be finite and positive, or None")
-        self.workers = min(4, os.cpu_count() or 1) if workers is None else workers
+        self.workers = (
+            workers or 1
+        )  # Accepted for compatibility; beam search is serial.
         self.time_limit = time_limit
         self.distance_pruning = distance_pruning
         self.turn_pruning = turn_pruning
         self.final_wall_pruning = final_wall_pruning
+        if not isinstance(beam_width, int) or beam_width < 1:
+            raise ValueError("beam_width must be a positive integer")
+        self.beam_width = beam_width
         self.search_complete = False
         self.search_cpu_seconds = 0.0
         self.search_wall_seconds = 0.0
@@ -144,93 +97,29 @@ class Player5(Player):
         self.best_score = float("-inf")
 
     def build_enclosure(self) -> Construction | None:
-        wall_started = time.monotonic()
+        """Run a bounded-width beam search over partial wall chains."""
+        started = time.monotonic()
         cpu_started = time.process_time()
-        children_started = _children_cpu_seconds()
-        # The same absolute deadline goes to every task. It is never divided
-        # by worker count or restarted when a worker begins execution.
-        deadline = None if self.time_limit is None else wall_started + self.time_limit
-        if self.workers == 1:
-            results = [self._search_partition(0, 1, deadline)]
-            worker_cpu = 0.0
-        else:
-            with ProcessPoolExecutor(
-                max_workers=self.workers,
-                mp_context=multiprocessing.get_context("spawn"),
-            ) as pool:
-                futures = [
-                    pool.submit(_run_partition, self, i, self.workers, deadline)
-                    for i in range(self.workers)
-                ]
-                results = [future.result() for future in futures]
-            children_finished = _children_cpu_seconds()
-            worker_cpu = (
-                children_finished - children_started
-                if children_started is not None
-                else sum(result[4] for result in results)
-            )
-        self.stats = SearchStats()
-        self.best_score = float("-inf")
-        self.search_complete = all(result[3] for result in results)
-        best = None
-        for candidate, stats, score, _, _ in results:
-            for field in fields(SearchStats):
-                setattr(
-                    self.stats,
-                    field.name,
-                    getattr(self.stats, field.name) + getattr(stats, field.name),
-                )
-            if candidate is not None and score > self.best_score:
-                best, self.best_score = candidate, score
-        self.search_cpu_seconds = time.process_time() - cpu_started + worker_cpu
-        self.search_wall_seconds = time.monotonic() - wall_started
-        outcome = (
-            f"best score {self.best_score:g}"
-            if best is not None
-            else "no solution found"
-        )
-        state = "complete" if self.search_complete else "deadline reached"
+        deadline = None if self.time_limit is None else started + self.time_limit
+        result = self._search_beam(deadline)
+        self.search_wall_seconds = time.monotonic() - started
+        self.search_cpu_seconds = time.process_time() - cpu_started
+        self.search_complete = False  # Beam truncation makes this heuristic search.
         self.note = (
-            f"DFS ({self.workers} workers, {state}): {self.stats.nodes} nodes, "
-            f"{self.stats.valid_polygons} valid polygons; {outcome}; "
-            f"elapsed {self.search_wall_seconds:.2f}s, total CPU {self.search_cpu_seconds:.2f}s"
+            f"Beam search (width {self.beam_width}): {self.stats.nodes} nodes, "
+            f"{self.stats.valid_polygons} valid polygons; "
+            f"{'solution score ' + format(self.best_score, 'g') if result else 'no solution found'}; "
+            f"elapsed {self.search_wall_seconds:.2f}s"
         )
-        return best
+        return result
 
-    def _search_partition(self, partition, partitions, deadline):
-        started = time.process_time()
-
-        def check_deadline():
-            if deadline is not None and time.monotonic() >= deadline:
-                raise _DeadlineReached
-
+    def _search_beam(self, deadline):
+        """Expand one complete straight face at a time, keeping a bounded beam."""
         self.stats = SearchStats()
         self.best_score = float("-inf")
         best = None
-        stock = self.inventory.copy()
+        stock0 = self.inventory.copy()
         room_area = self.room.polygon.buffer(TOL)
-        return_lengths = sorted(
-            (
-                length
-                for length in stock.walls
-                if MIN_WALL_LENGTH <= length <= MAX_FACE_LENGTH
-            ),
-            reverse=True,
-        )
-
-        def maximum_return_distance():
-            # Each added wall needs a connector, and the root needs one more.
-            # Ignore turns/obstacles to overestimate reach, never underestimate it.
-            slots = max(0, stock.count_connectors() - 1)
-            reach = 0
-            for length in return_lengths:
-                count = min(max(0, stock.walls[length]), slots)
-                reach += length * count
-                slots -= count
-                if slots == 0:
-                    break
-            return reach
-
         choices = [
             Connector(kind, reflex)
             for kind in ConnectorType
@@ -238,182 +127,276 @@ class Player5(Player):
                 (False,) if kind == ConnectorType.STRAIGHT else (False, True)
             )
         ]
-        pieces = []
-        # Internal joints only. The root's closing joint is chosen at closure.
-        joints = []
-        points = []
-        start = None
+        turns = [joint for joint in choices if not joint.is_straight()]
+        lengths = sorted(
+            k
+            for k, n in stock0.walls.items()
+            if n and MIN_WALL_LENGTH <= k <= MAX_FACE_LENGTH
+        )
 
-        def endpoint(heading, length):
-            theta = math.radians(heading)
-            x, y = points[-1]
-            return x + length * math.cos(theta), y + length * math.sin(theta)
+        def heuristic(state):
+            # Estimate area if the chain closed directly to its gate start.
+            # Balance that reward against closure distance so large dead ends
+            # do not crowd every closeable partial chain out of the beam.
+            pts = state["points"]
+            ring = [*pts, pts[0]]
+            doubled_area = sum(
+                x * ny - nx * y for (x, y), (nx, ny) in zip(ring, ring[1:])
+            )
+            estimated_area = abs(doubled_area) / 2
+            distance = math.dist(pts[-1], pts[0])
+            return distance - AREA_HEURISTIC_WEIGHT * estimated_area
 
-        def search(heading, face_length):
-            nonlocal best
-            check_deadline()
-            self.stats.nodes += 1
-            distance_to_start = math.dist(points[-1], start)
-            closed = distance_to_start <= TOL
-            if closed:
-                if len(pieces) >= MIN_ENCLOSURE_PIECES:
+        def face_extensions(state):
+            """Use bounded knapsack choices to build a complete straight face."""
+            at_gate = len(state["pieces"]) == 1
+            starts = choices if at_gate else turns
+            for first_joint in starts:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return
+                if state["stock"].connectors.get(first_joint.connector_type, 0) <= 0:
+                    continue
+                heading = state["heading"] + first_joint.turn_angle()
+                initial_face = state["face"] if first_joint.is_straight() else 0
+                face_limit = MAX_FACE_LENGTH - initial_face
+                after_joint = state["stock"].copy()
+                after_joint.connectors[first_joint.connector_type] -= 1
+                max_pieces = min(
+                    6,
+                    sum(after_joint.walls.values()),
+                    max(0, after_joint.count_connectors() - 1),
+                    after_joint.connectors.get(ConnectorType.STRAIGHT, 0) + 1,
+                    int(face_limit // MIN_WALL_LENGTH),
+                )
+                if max_pieces <= 0:
+                    continue
+
+                # dp[(piece_count, total_length)] holds up to two different
+                # wall multisets. Length order within a straight face does not
+                # affect its endpoint, so multisets avoid permutation repeats.
+                zero = (0,) * len(lengths)
+                dp = {(0, 0): [zero]}
+                for index, length in enumerate(lengths):
+                    updated = {
+                        key: list(allocations) for key, allocations in dp.items()
+                    }
+                    available = max(0, state["stock"].walls.get(length, 0))
+                    for (piece_count, total), allocations in dp.items():
+                        for quantity in range(
+                            1,
+                            min(
+                                available,
+                                max_pieces - piece_count,
+                                (face_limit - total) // length,
+                            )
+                            + 1,
+                        ):
+                            key = (piece_count + quantity, total + quantity * length)
+                            options = updated.setdefault(key, [])
+                            for allocation in allocations:
+                                candidate_allocation = list(allocation)
+                                candidate_allocation[index] += quantity
+                                candidate_allocation = tuple(candidate_allocation)
+                                if (
+                                    candidate_allocation not in options
+                                    and len(options) < 2
+                                ):
+                                    options.append(candidate_allocation)
+                    dp = updated
+
+                px, py = state["points"][-1]
+                rad = math.radians(heading)
+                legal_totals = {}
+                for piece_count, total in dp:
+                    if piece_count == 0:
+                        continue
+                    end = (px + total * math.cos(rad), py + total * math.sin(rad))
+                    if not room_area.covers(LineString([state["points"][-1], end])):
+                        continue
+                    check_end = (
+                        state["start"] if math.dist(end, state["start"]) <= TOL else end
+                    )
+                    if not LineString([*state["points"], check_end]).is_simple:
+                        continue
+                    legal_totals[(piece_count, total)] = end
+                if not legal_totals:
+                    continue
+
+                candidates = []
+                for (piece_count, total), end in legal_totals.items():
+                    for allocation in dp[(piece_count, total)]:
+                        next_stock = after_joint.copy()
+                        pieces_to_add = []
+                        for length, quantity in zip(lengths, allocation):
+                            next_stock.walls[length] -= quantity
+                            pieces_to_add.extend([length] * quantity)
+                        next_stock.connectors[ConnectorType.STRAIGHT] -= piece_count - 1
+                        points = list(state["points"])
+                        for length in pieces_to_add:
+                            prior_x, prior_y = points[-1]
+                            points.append(
+                                (
+                                    prior_x + length * math.cos(rad),
+                                    prior_y + length * math.sin(rad),
+                                )
+                            )
+                        candidate = {
+                            "start": state["start"],
+                            "points": points,
+                            "heading": heading,
+                            "face": initial_face + total,
+                            "pieces": [
+                                *state["pieces"],
+                                *(
+                                    Piece(PieceType.WALL, length)
+                                    for length in pieces_to_add
+                                ),
+                            ],
+                            "joints": [
+                                *state["joints"],
+                                first_joint,
+                                *(
+                                    Connector(ConnectorType.STRAIGHT)
+                                    for _ in range(piece_count - 1)
+                                ),
+                            ],
+                            "stock": next_stock,
+                        }
+                        candidates.append((candidate, total, piece_count, allocation))
+
+                selected = []
+
+                def keep_best(options):
+                    for option in sorted(options, key=lambda item: heuristic(item[0])):
+                        signature = (option[1], option[2], option[3])
+                        if all(
+                            (item[1], item[2], item[3]) != signature
+                            for item in selected
+                        ):
+                            selected.append(option)
+                            return
+
+                longest = max(option[1] for option in candidates)
+                keep_best([option for option in candidates if option[1] == longest])
+                keep_best(candidates)
+                shorter = [option for option in candidates if option[1] < longest]
+                if shorter:
+                    target = longest * 0.7
+                    closest_total = min(abs(option[1] - target) for option in shorter)
+                    keep_best(
+                        [
+                            option
+                            for option in shorter
+                            if abs(option[1] - target) == closest_total
+                        ]
+                    )
+                yield from (option[0] for option in selected)
+
+        frontier = []
+        theta = math.radians(self.start_heading)
+        for gate_length, count in sorted(stock0.gates.items()):
+            if (
+                count <= 0
+                or gate_length < MIN_WALL_LENGTH
+                or gate_length > MAX_FACE_LENGTH
+            ):
+                continue
+            if self.gate_length is not None and gate_length != self.gate_length:
+                continue
+            start = self.start or self.edge_start
+            end = (
+                start[0] + gate_length * math.cos(theta),
+                start[1] + gate_length * math.sin(theta),
+            )
+            if not room_area.covers(LineString([start, end])):
+                self.stats.boundary_prunes += 1
+                continue
+            stock = stock0.copy()
+            stock.gates[gate_length] -= 1
+            frontier.append(
+                {
+                    "start": start,
+                    "points": [start, end],
+                    "heading": self.start_heading,
+                    "face": gate_length,
+                    "pieces": [Piece(PieceType.GATE, gate_length)],
+                    "joints": [],
+                    "stock": stock,
+                }
+            )
+
+        while frontier:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            expanded = []
+            for state in frontier:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return best
+                self.stats.nodes += 1
+                stock = state["stock"]
+                pts = state["points"]
+                distance = math.dist(pts[-1], state["start"])
+                if distance <= TOL and len(state["pieces"]) >= MIN_ENCLOSURE_PIECES:
                     for closing in choices:
                         if stock.connectors.get(closing.connector_type, 0) <= 0:
                             continue
                         gap = (
-                            heading + closing.turn_angle() - self.start_heading
+                            state["heading"] + closing.turn_angle() - self.start_heading
                         ) % 360
                         if min(gap, 360 - gap) > ANGLE_TOL:
                             continue
                         candidate = Construction(
-                            start,
+                            state["start"],
                             self.start_heading,
-                            list(pieces),
-                            [closing, *joints],
+                            list(state["pieces"]),
+                            [closing, *state["joints"]],
                         )
+                        candidate = self._add_second_gate(candidate)
                         self.stats.closed_candidates += 1
-                        result = validate_construction(
+                        valid = validate_construction(
                             candidate, self.room, self.inventory
                         )
-                        if result.valid:
+                        if valid.valid:
                             self.stats.valid_polygons += 1
-                            score = score_construction(result, self.weights)
+                            score = score_construction(valid, self.weights)
                             if score > self.best_score:
                                 best, self.best_score = candidate, score
-                # Extending a closed loop would revisit a vertex: never simple.
-                return
-
-            # One extra connector is always required to close at the root.
-            if sum(stock.walls.values()) == 0 or stock.count_connectors() < 2:
-                self.stats.exhausted_leaves += 1
-                return
-
-            # By the triangle inequality, no chain of the remaining walls
-            # can reach the start if even its maximum total length is too short.
-            if (
-                self.distance_pruning
-                and distance_to_start > maximum_return_distance() + TOL
-            ):
-                self.stats.distance_prunes += 1
-                return
-
-            if self.turn_pruning or self.final_wall_pruning:
-                remaining_walls = sum(stock.walls[length] for length in return_lengths)
-                remaining_connectors = stock.count_connectors()
-                maximum_walls = min(remaining_walls, remaining_connectors - 1)
-            if self.turn_pruning and not _turn_completion_possible(
-                round((heading - self.start_heading) / 45),
-                stock.connectors.get(ConnectorType.RIGHT, 0),
-                stock.connectors.get(ConnectorType.DIAGONAL, 0),
-                stock.connectors.get(ConnectorType.STRAIGHT, 0),
-                max(2, MIN_ENCLOSURE_PIECES - len(pieces) + 1),
-                maximum_walls + 1,
-            ):
-                self.stats.turn_prunes += 1
-                return
-
-            last_wall = self.final_wall_pruning and maximum_walls == 1
-            for joint_index, joint in enumerate(choices):
-                if not stock.take_connector(joint.connector_type):
                     continue
-                next_heading = heading + joint.turn_angle()
-                for wall_index, (length, count) in enumerate(stock.walls.items()):
-                    check_deadline()
-                    if (
-                        len(pieces) == 1
-                        and (joint_index * len(stock.walls) + wall_index) % partitions
-                        != partition
-                    ):
-                        continue
-                    if count <= 0 or length < MIN_WALL_LENGTH:
-                        continue
-                    next_face = face_length + length if joint.is_straight() else length
-                    if next_face > MAX_FACE_LENGTH + TOL:
-                        self.stats.face_prunes += 1
-                        continue
-                    end = endpoint(next_heading, length)
-                    if last_wall:
-                        can_close = False
-                        if (
-                            len(pieces) + 1 >= MIN_ENCLOSURE_PIECES
-                            and math.dist(end, start) <= TOL
-                        ):
-                            for closing in choices:
-                                if stock.connectors.get(closing.connector_type, 0) <= 0:
-                                    continue
-                                gap = (
-                                    next_heading
-                                    + closing.turn_angle()
-                                    - self.start_heading
-                                ) % 360
-                                if min(gap, 360 - gap) <= ANGLE_TOL:
-                                    can_close = True
-                                    break
-                        if not can_close:
-                            self.stats.final_wall_prunes += 1
-                            continue
-                    if not room_area.covers(LineString([points[-1], end])):
-                        self.stats.boundary_prunes += 1
-                        continue
-                    # Snap only the simplicity check to handle floating point
-                    # closure. Keep actual coordinates for the official judge.
-                    check_end = start if math.dist(end, start) <= TOL else end
-                    if not LineString([*points, check_end]).is_simple:
-                        self.stats.crossing_prunes += 1
-                        continue
-                    stock.walls[length] -= 1
-                    pieces.append(Piece(PieceType.WALL, length))
-                    joints.append(joint)
-                    points.append(end)
-                    search(next_heading, next_face)
-                    points.pop()
-                    joints.pop()
-                    pieces.pop()
-                    stock.walls[length] += 1
-                stock.connectors[joint.connector_type] += 1
+                if sum(stock.walls.values()) == 0 or stock.count_connectors() < 2:
+                    self.stats.exhausted_leaves += 1
+                    continue
+                expanded.extend(face_extensions(state))
+            expanded.sort(key=heuristic)
+            frontier = expanded[: self.beam_width]
+        return best
 
-        complete = True
-        try:
-            check_deadline()
-            for length, count in sorted(stock.gates.items()):
-                check_deadline()
-                if (
-                    count <= 0
-                    or length < MIN_WALL_LENGTH
-                    or (self.gate_length is not None and length != self.gate_length)
-                ):
+    def _add_second_gate(self, construction):
+        """Replace a wall with a same-length gate on another face when possible."""
+        faces = compute_faces(construction)
+        used_gates = {}
+        for piece in construction.pieces:
+            if piece.is_gate:
+                used_gates[piece.length] = used_gates.get(piece.length, 0) + 1
+
+        for face in faces:
+            if face.has_gate:
+                continue
+            for piece_index in face.piece_indices:
+                piece = construction.pieces[piece_index]
+                if piece.is_gate:
                     continue
-                if length > MAX_FACE_LENGTH + TOL:
-                    self.stats.face_prunes += 1
+                already_used = used_gates.get(piece.length, 0)
+                if self.inventory.gates.get(piece.length, 0) <= already_used:
                     continue
-                theta = math.radians(self.start_heading)
-                start = (
-                    self.start
-                    if self.start is not None
-                    else (
-                        self.edge_midpoint[0] - length * math.cos(theta) / 2,
-                        self.edge_midpoint[1] - length * math.sin(theta) / 2,
-                    )
+                pieces = list(construction.pieces)
+                pieces[piece_index] = Piece(PieceType.GATE, piece.length)
+                candidate = Construction(
+                    construction.start,
+                    construction.start_heading,
+                    pieces,
+                    list(construction.connectors),
                 )
-                points[:] = [start]
-                end = endpoint(self.start_heading, length)
-                if not room_area.covers(LineString([start, end])):
-                    self.stats.boundary_prunes += 1
-                    continue
-                stock.gates[length] -= 1
-                pieces.append(Piece(PieceType.GATE, length))
-                points.append(end)
-                search(self.start_heading, length)
-                points.pop()
-                pieces.pop()
-                stock.gates[length] += 1
-
-        except _DeadlineReached:
-            complete = False
-        return (
-            best,
-            self.stats,
-            self.best_score,
-            complete,
-            time.process_time() - started,
-        )
+                result = validate_construction(candidate, self.room, self.inventory)
+                if result.valid and result.second_gate_bonus:
+                    return candidate
+        return construction
