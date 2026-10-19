@@ -156,6 +156,7 @@ class Grower:
         score: Callable[[float, float], float],  # (area, perimeter) -> most it scores
         accept: Callable[[tuple[float, float], float, Faces], float | None],
         can_build: Callable[[tuple[int, ...]], bool],
+        max_faces: int = MAX_FACES,
     ):
         self.region = region
         self.room_corners = room_corners
@@ -170,6 +171,7 @@ class Grower:
         self.accept = accept
         # whether the inventory has pieces for these face lengths
         self.can_build = can_build
+        self.max_faces = max_faces
         self.directions = range(8) if diagonals > 0 else range(0, 8, 2)
         self.smallest = tuple(sorted(buildable)[:2])
         self.longest = max(buildable)
@@ -348,7 +350,7 @@ class Grower:
                             at[j], rest + [(g, d)] + run + [(back, d)]
                         )
                         size = len(new)
-                        if size < 4 or size > MAX_FACES or (kick and size <= n):
+                        if size < 4 or size > self.max_faces or (kick and size <= n):
                             continue
                         key2 = (round(pos[0], 5), round(pos[1], 5), tuple(new))
                         if key2 in seen:
@@ -386,7 +388,7 @@ class Grower:
                                     + [(t1, d), (t2, d)],
                                 )
                                 size = len(new)
-                                if size < 4 or size > MAX_FACES:
+                                if size < 4 or size > self.max_faces:
                                     continue
                                 key2 = (round(pos[0], 5), round(pos[1], 5), tuple(new))
                                 if key2 in seen:

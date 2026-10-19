@@ -66,6 +66,8 @@ class Shape:
     def describe(self) -> str:
         if self.family == FREE:
             return f"{FREE}, {len(self.faces)} faces"
+        if self.family == "polish":
+            return f"polish, {len(self.faces)} faces"
         return f"{self.family} {'x'.join(str(p) for p in self.params)}"
 
 

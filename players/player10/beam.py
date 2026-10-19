@@ -22,7 +22,7 @@ import shapely
 from shapely.geometry import LineString, Point
 from shapely.geometry.polygon import orient
 
-from players.player10.shapes import Shape
+from players.player10.shapes import FREE, Shape
 from src.pieces import ConnectorType
 
 TURNS = (90, 45, -45, -90)  # degrees, left (+) is counter-clockwise
@@ -54,7 +54,15 @@ def _wrap(angle: float) -> float:
 
 class Walker:
     def __init__(
-        self, room_search, lengths, total_length, rights, diagonals, weights
+        self,
+        room_search,
+        lengths,
+        total_length,
+        rights,
+        diagonals,
+        weights,
+        can_supply=None,
+        diverse=False,
     ) -> None:
         self.region = room_search.region
         self.lengths = sorted(lengths)
@@ -63,6 +71,8 @@ class Walker:
         self.max_rights, self.max_diagonals = rights, diagonals
         self.A, self.C = weights.A, weights.C
         self.max_faces = MAX_FACES
+        self.can_supply = can_supply
+        self.diverse = diverse
 
     # ------------------------------------------------------------ scoring
 
@@ -109,6 +119,9 @@ class Walker:
                 ok &= ~shapely.intersects(segs, earlier)
             for L, end, good in zip(lengths, ends, ok):
                 if good:
+                    faces = w.faces + (L,)
+                    if self.can_supply is not None and not self.can_supply(faces):
+                        continue
                     lattice = tuple(a + b for a, b in zip(w.lattice, _step(h, L)))
                     out.append(
                         Walk(
@@ -116,7 +129,7 @@ class Walker:
                             h,
                             turned,
                             lattice,
-                            w.faces + (L,),
+                            faces,
                             w.turns + (turn,),
                             rights,
                             diagonals,
@@ -170,24 +183,76 @@ class Walker:
                         closed.append(done)
                     value = self._value(child)
                     key = (child.lattice, child.heading, child.turned, round(value, 1))
-                    nxt[key] = (value, child)
-            beam = [
-                w for _, w in heapq.nlargest(width, nxt.values(), key=lambda t: t[0])
-            ]
+                    if self.diverse:
+                        # Equal endpoints can have very different remaining stock
+                        # and geometry.  Keeping the face multiset prevents a broad
+                        # rectangle from erasing every irregular path that could
+                        # later close and fit a non-convex room.
+                        key += (tuple(sorted(child.faces)),)
+                    old = nxt.get(key)
+                    if old is None or value > old[0]:
+                        nxt[key] = (value, child)
+            beam = self._select(list(nxt.values()), width)
             if not beam:
                 break
         return closed
 
+    def _select(self, scored: list[tuple[float, Walk]], width: int) -> list[Walk]:
+        """Keep high-value paths without losing every non-rectangular topology.
+
+        The usual short room walk benefits from a pure score beam.  The deeper
+        diversity-enabled walk groups states by material used, number of faces,
+        and diagonal corners.  These resources distinguish useful concave and
+        angled loops from the rectangles favored by the partial-chord score.
+        """
+        if not self.diverse:
+            return [
+                w
+                for _, w in heapq.nlargest(width, scored, key=lambda item: item[0])
+            ]
+        buckets: dict[tuple[int, int, int], list[tuple[float, Walk]]] = {}
+        for value, walk in scored:
+            key = (sum(walk.faces) // 8, len(walk.faces), walk.diagonals)
+            buckets.setdefault(key, []).append((value, walk))
+        if not buckets:
+            return []
+        share = max(1, width // len(buckets))
+        kept: list[tuple[float, Walk]] = []
+        rest: list[tuple[float, Walk]] = []
+        for bucket in buckets.values():
+            bucket.sort(key=lambda item: item[0], reverse=True)
+            kept.extend(bucket[:share])
+            rest.extend(bucket[share:])
+        if len(kept) < width:
+            kept.extend(
+                heapq.nlargest(width - len(kept), rest, key=lambda item: item[0])
+            )
+        elif len(kept) > width:
+            kept = heapq.nlargest(width, kept, key=lambda item: item[0])
+        return [walk for _, walk in kept]
+
 
 def _make_shape(faces: tuple, turns: tuple) -> Shape:
-    draft = Shape("free", faces, faces, tuple(float(t) for t in turns), 0.0, 0.0)
+    draft = Shape(FREE, faces, faces, tuple(float(t) for t in turns), 0.0, 0.0)
     pts = np.array(draft.vertices())
     x, y = pts[:, 0], pts[:, 1]
     area = 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
-    return Shape("free", faces, faces, draft.turns, float(area), float(sum(faces)))
+    return Shape(FREE, faces, faces, draft.turns, float(area), float(sum(faces)))
 
 
-def free_shapes(room_search, assigner, inventory, weights, deadline):
+def free_shapes(
+    room_search,
+    assigner,
+    inventory,
+    weights,
+    deadline,
+    *,
+    widths=WIDTHS,
+    max_faces=MAX_FACES,
+    max_starts=None,
+    diverse_starts=False,
+    diverse_beam=False,
+):
     """Yield (shape, start, heading) for closed polygons that fit the room, widening
     the beam each round and best-ranked first within a round. The caller checks the
     pieces (Assigner) and the simulator's validator."""
@@ -198,18 +263,51 @@ def free_shapes(room_search, assigner, inventory, weights, deadline):
         inventory.connectors.get(ConnectorType.RIGHT, 0),
         inventory.connectors.get(ConnectorType.DIAGONAL, 0),
         weights,
+        assigner.can_supply,
+        diverse=diverse_beam,
     )
+    walker.max_faces = max_faces
     ring = list(orient(room_search.polygon, 1.0).exterior.coords)[:-1]
     starts = []
     for i, p in enumerate(ring):
         q = ring[(i + 1) % len(ring)]
         # first face runs along the wall leaving this corner (interior on the left)
-        starts.append((p, math.degrees(math.atan2(q[1] - p[1], q[0] - p[0]))))
+        length = math.dist(p, q)
+        base = math.degrees(math.atan2(q[1] - p[1], q[0] - p[0]))
+        starts.append((length, i, p, base))
+        if diverse_starts:
+            midpoint = ((p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0)
+            # A high-area loop need not begin at a room corner or follow the
+            # boundary. The +45 heading points into a CCW room; containment in
+            # Walker._extend still rejects variants that point outside locally.
+            starts.extend(
+                (
+                    (length, i, midpoint, base),
+                    (length, i, p, base + 45.0),
+                    (length, i, midpoint, base + 45.0),
+                )
+            )
+    if diverse_starts:
+        order = len(starts)
+        for centre in room_search.centres:
+            point = (float(centre[0]), float(centre[1]))
+            for base in room_search.base_headings(45):
+                starts.append((0.0, order, point, base))
+                order += 1
+        unique = {}
+        for item in starts:
+            key = (round(item[2][0], 6), round(item[2][1], 6), round(item[3] % 360, 6))
+            unique.setdefault(key, item)
+        starts = list(unique.values())
+    if max_starts is not None:
+        # Long boundary edges are the most useful anchors in large rooms and
+        # allow an extended pass to spend its budget on a representative subset.
+        starts = sorted(starts, key=lambda item: (-item[0], item[1]))[:max_starts]
 
     seen = set()
-    for width in WIDTHS:
+    for width in widths:
         batch = []
-        for start, base in starts:
+        for _, _, start, base in starts:
             if time.process_time() > deadline:
                 break
             for faces, turns in walker.run(start, base, width, deadline):
