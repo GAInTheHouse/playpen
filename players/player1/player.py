@@ -3,7 +3,8 @@
 At each spot in the room, place the highest-scoring rectangle, hexagon or
 octagon the stock can build that fits there. Taking the spots best first,
 keep making the change that raises the score most until no change does, or
-CHECK_LIMIT shapes have been scored. Return the best loop.
+CHECK_LIMIT shapes have been scored. Then push the loop flush against a room
+wall and climb again, for as long as that ends higher. Return the best loop.
 """
 
 import functools
@@ -42,6 +43,7 @@ FIT_RECTANGLES = 12  # rectangle sizes tried, highest estimated score first
 FIT_HEXAGONS = 8  # hexagon sizes tried, highest estimated score first
 FIT_OCTAGONS = 8  # octagon sizes tried, highest estimated score first
 FIT_SHARE = 0.3  # of the time, at most, spent fitting shapes to spots
+FLUSH_REACH = 6  # how far, at most, a loop is pushed to meet a wall
 LENGTHS = range(c.MIN_WALL_LENGTH, c.MAX_FACE_LENGTH + 1)
 
 CONNECTOR_FOR_TURN = {  # turn in degrees -> connector
@@ -513,6 +515,24 @@ def placements_at(shape: Loop, rotation: float, room: Room, floor) -> list:
     ]
 
 
+def flush_shifts(loop: Loop, room: Room) -> set[tuple[float, float]]:
+    """Each move of the whole loop, shorter than FLUSH_REACH, that puts one
+    of its faces against a room wall running the same way."""
+    points = corners(loop)
+    shifts = set()
+    for (ax, ay), (bx, by) in zip(points, points[1:] + points[:1]):
+        face_angle = math.atan2(by - ay, bx - ax)
+        for (x1, y1), (x2, y2) in itertools.pairwise(room.polygon.exterior.coords):
+            wall_angle = math.atan2(y2 - y1, x2 - x1)
+            if abs(math.sin(face_angle - wall_angle)) > c.TOL:
+                continue
+            nx, ny = -math.sin(wall_angle), math.cos(wall_angle)
+            distance = (x1 - ax) * nx + (y1 - ay) * ny
+            if c.TOL < abs(distance) < FLUSH_REACH:
+                shifts.add((round(distance * nx, 6), round(distance * ny, 6)))
+    return shifts
+
+
 def initial_solutions(
     shapes: list[Scored], room: Room, floor, deadline: float
 ) -> list[Loop]:
@@ -592,6 +612,23 @@ class Player1(Player):
             current = max(better, key=lambda n: n.score)
         return current
 
+    def push_to_walls(self, result: Scored, deadline: float) -> Scored:
+        """Move the loop flush against a wall and climb again; keep the first
+        move that ends higher, and repeat until none does."""
+        improved = True
+        while improved and not self.out_of_work(deadline):
+            improved = False
+            for dx, dy in flush_shifts(result.loop, self.room):
+                x, y = result.loop.start
+                moved = result.loop.moved_to((x + dx, y + dy))
+                if self.evaluate(moved) is None:
+                    continue
+                climbed = self.hill_climb(moved, deadline)
+                if climbed.score > result.score:
+                    result, improved = climbed, True
+                    break
+        return result
+
     def build_enclosure(self) -> Construction | None:
         now = time.process_time()
         deadline = now + CPU_SECONDS  # covers placing and growing too
@@ -605,7 +642,8 @@ class Player1(Player):
                 break  # out of work; the first start is always searched
             if self.evaluate(placement) is None:
                 continue  # fits only within rounding error
-            results.append(self.hill_climb(placement, deadline))
+            climbed = self.hill_climb(placement, deadline)
+            results.append(self.push_to_walls(climbed, deadline))
         if not results:
             self.note = "no starting shape fits: nothing built"
             return None
