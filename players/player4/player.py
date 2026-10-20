@@ -7,6 +7,8 @@ from shapely.geometry.polygon import orient
 from players.player0 import Player
 from players.player4.faces import FaceCatalog
 from players.player4.limits import max_pieces_per_face
+from players.player4.macro import MacroBeamSearch, buildable_lengths, should_use_macro
+from players.player4.realize import realize_closed
 from players.player4.restart_anchors import anchors_from_construction
 from players.player4.search import Anchor, BeamSearch, Closed, connector_for
 from src.constants import TOL
@@ -51,8 +53,23 @@ class Player4(Player):
         budget_end = begin + SEARCH_SECONDS
         walls = room_anchors(self.room.polygon)
 
+        best, best_score = None, 0.0
+        if should_use_macro(self.inventory):
+            macro_end = begin + SEARCH_SECONDS * 0.5
+            best, best_score = self._macro_phase(
+                room, catalog, connectors, walls, macro_end, best, best_score
+            )
+
         best, best_score, ranked = self._search_phases(
-            room, catalog, connectors, walls, budget_end, BEAM_WIDTHS, track_scores=True
+            room,
+            catalog,
+            connectors,
+            walls,
+            budget_end,
+            BEAM_WIDTHS,
+            best,
+            best_score,
+            track_scores=True,
         )
         if best is not None and time.process_time() < budget_end:
             best, best_score = self._search_phases(
@@ -89,6 +106,57 @@ class Player4(Player):
             f" ({time.process_time() - begin:.1f}s CPU)"
         )
         return best
+
+    def _macro_phase(
+        self,
+        room,
+        catalog: FaceCatalog,
+        connectors: tuple[int, int, int],
+        anchors: list[Anchor],
+        budget_end: float,
+        best: Construction | None,
+        best_score: float,
+    ) -> tuple[Construction | None, float]:
+        face_lengths = tuple(catalog.lengths)
+        realizable = buildable_lengths(face_lengths)
+        min_piece = min(face_lengths)
+        notch_run = min_piece
+        per_anchor = max(1, len(anchors))
+        for k, anchor in enumerate(anchors):
+            now = time.process_time()
+            if now >= budget_end:
+                break
+            remaining_anchors = len(anchors) - k
+            deadline = now + (budget_end - now) / remaining_anchors
+            search = MacroBeamSearch(
+                anchor,
+                catalog,
+                connectors,
+                self.weights,
+                room,
+                40,
+                deadline,
+                realizable,
+                min_piece,
+                notch_run,
+            )
+            try:
+                candidates = search.run()
+            except Exception:
+                continue
+            for macro_closed in candidates:
+                construction = realize_closed(
+                    anchor, macro_closed, catalog, connectors, self.weights, room
+                )
+                if construction is None:
+                    continue
+                result = validate_construction(construction, self.room, self.inventory)
+                if result.valid:
+                    score = score_construction(result, self.weights)
+                    if score > best_score:
+                        best = construction
+                        best_score = score
+        return best, best_score
 
     def _search_phases(
         self,
