@@ -3,7 +3,7 @@
 At each spot in the room, place the highest-scoring rectangle, hexagon or
 octagon the stock can build that fits there. Taking the spots best first,
 keep making the change that raises the score most until no change does, or
-time runs out. Return the best loop.
+CHECK_LIMIT shapes have been scored. Return the best loop.
 """
 
 import functools
@@ -31,9 +31,12 @@ from src.inventory import Inventory
 from src.pieces import Connector, ConnectorType, Piece, PieceType
 from src.room import Room
 
-# total CPU time per room, kept under 10 s (a search step can run a little past
-# it); set PLAYER1_CPU_SECONDS in the environment to override
-CPU_SECONDS = float(os.environ.get("PLAYER1_CPU_SECONDS", "9"))
+# the search stops after scoring this many shapes, so a run does the same work
+# on any computer
+CHECK_LIMIT = 200_000
+# a backup only: CPU time per room, 10 s under the simulator's 300 s limit; set
+# PLAYER1_CPU_SECONDS in the environment to override
+CPU_SECONDS = float(os.environ.get("PLAYER1_CPU_SECONDS", "290"))
 MAX_STARTS = 40  # placements kept, more than the search ever reaches
 FIT_RECTANGLES = 12  # rectangle sizes tried, highest estimated score first
 FIT_HEXAGONS = 8  # hexagon sizes tried, highest estimated score first
@@ -546,11 +549,16 @@ class Player1(Player):
         super().__init__(room, inventory, weights)
         self.floor = room.polygon.buffer(c.TOL)
         shapely.prepare(self.floor)
+        self.checks = 0  # shapes scored so far
+
+    def out_of_work(self, deadline: float) -> bool:
+        return self.checks >= CHECK_LIMIT or time.process_time() >= deadline
 
     def evaluate(self, loop: Loop) -> float | None:
         """The simulator's score for `loop`, or None if it would be invalid.
         A loop with a corner outside the room is pruned before the (much
         slower) full validation, which would reject it anyway."""
+        self.checks += 1
         xs, ys = zip(*corners(loop))
         if not shapely.contains_xy(self.floor, xs, ys).all():
             return None
@@ -559,18 +567,25 @@ class Player1(Player):
             return None
         return score_construction(result, self.weights)
 
-    def scored_neighbors(self, loop: Loop) -> list[Scored]:
-        return [
-            Scored(neighbor, score)
-            for neighbor in neighboring_loops(loop, self.inventory)
-            if (score := self.evaluate(neighbor)) is not None
-        ]
+    def scored_neighbors(self, loop: Loop, deadline: float) -> list[Scored] | None:
+        """The valid neighbors of `loop`, scored; None if time runs out
+        part-way, so that a long step never runs past the deadline."""
+        scored = []
+        for neighbor in neighboring_loops(loop, self.inventory):
+            if time.process_time() >= deadline:
+                return None
+            score = self.evaluate(neighbor)
+            if score is not None:
+                scored.append(Scored(neighbor, score))
+        return scored
 
     def hill_climb(self, loop: Loop, deadline: float) -> Scored:
-        """Step to the best neighbor until none is better."""
+        """Step to the best neighbor until none is better, or out of work."""
         current = Scored(loop, self.evaluate(loop))
-        while time.process_time() < deadline:
-            neighbors = self.scored_neighbors(current.loop)
+        while not self.out_of_work(deadline):
+            neighbors = self.scored_neighbors(current.loop, deadline)
+            if neighbors is None:
+                break  # out of time part-way through this step
             better = [n for n in neighbors if n.score > current.score]
             if not better:
                 break
@@ -586,8 +601,8 @@ class Player1(Player):
 
         results = []
         for placement in placements:
-            if results and time.process_time() >= deadline:
-                break  # out of time; the first start is always searched
+            if results and self.out_of_work(deadline):
+                break  # out of work; the first start is always searched
             if self.evaluate(placement) is None:
                 continue  # fits only within rounding error
             results.append(self.hill_climb(placement, deadline))
@@ -595,7 +610,7 @@ class Player1(Player):
             self.note = "no starting shape fits: nothing built"
             return None
         best = max(results, key=lambda result: result.score)
-        self.note = f"{len(placements)} initial solutions; best {best.score:.0f} ({len(best.loop.faces)} faces)"
+        self.note = f"{len(placements)} initial solutions, {self.checks} shapes scored; best {best.score:.0f} ({len(best.loop.faces)} faces)"
         # A: an enclosure that scores below zero is worse than none at all
         if best.score <= 0:
             self.note += " -- below zero, so nothing is built"
