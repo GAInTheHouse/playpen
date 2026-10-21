@@ -61,6 +61,11 @@ MAX_FACES = 80
 # same as several short ones, and trying every pair costs too much.
 ALL_CORNERS_UP_TO = 16
 CORNER_REACH = 4
+# A loop with more faces than this climbs a window of cut points at a time:
+# trying every slide round a 400-face loop for each step it takes leaves no time
+# for steps, and a slide far from the last one is still there to take later.
+WINDOW_FACES = 60
+WINDOW_CUTS = 48
 ASSIGN_TRIES = 40  # how many of a step's best fitting candidates get pieces assigned
 KICKS = 8  # face-adding moves tried from each stuck loop
 BEAM = 3
@@ -230,6 +235,7 @@ class Grower:
         # whether a charged face may be any length, or only longer than the limit
         self.any_length = False
         self.first_charge = 1.0
+        self.window_at = 0.0  # where the next window starts, as a share of the cuts
 
     # ----------------------------------------------------------------- moves
 
@@ -299,12 +305,19 @@ class Grower:
     def _value(self, score: float, over: int) -> float:
         return score - self.charge * over if over else score
 
-    def _moves(self, loop: Loop, slides: tuple[int, ...], kick: bool) -> list[tuple]:
+    def _moves(
+        self,
+        loop: Loop,
+        slides: tuple[int, ...],
+        kick: bool,
+        window: tuple[int, int] | None = None,
+    ) -> list[tuple]:
         """Every loop one slide away that the stock allows, as (where it starts
-        in the old frame, faces, score, units over). Remembered for the loop
-        last asked about: raising the charge asks again about the same loop."""
+        in the old frame, faces, score, units over); with `window` (first cut,
+        how many), only the runs that start at those cuts. Remembered for the
+        loop last asked about: raising the charge asks again about the same loop."""
         strict = self.charge == math.inf
-        key = (loop.start, loop.faces, slides, kick, strict, self.any_length)
+        key = (loop.start, loop.faces, slides, kick, strict, self.any_length, window)
         if key in self._remembered:
             return self._remembered[key]
         if self._remembered_for != (loop.start, loop.faces):
@@ -331,7 +344,10 @@ class Grower:
         far = n if n <= ALL_CORNERS_UP_TO else CORNER_REACH
         seen = set()
         found = []
-        for i in range(m):
+        firsts = range(m)
+        if window is not None:
+            firsts = [(window[0] + k) % m for k in range(min(window[1], m))]
+        for i in firsts:
             crossed = 0  # corners passed on the way from cut i to cut j
             for span in range(1, m):
                 j = (i + span) % m
@@ -425,12 +441,14 @@ class Grower:
         self._remembered[key] = found
         return found
 
-    def _candidates(self, loop: Loop, slides: tuple[int, ...], kick: bool) -> list:
+    def _candidates(
+        self, loop: Loop, slides: tuple[int, ...], kick: bool, window=None
+    ) -> list:
         """The moves worth testing against the room, best first, as
         (value, where it starts in the old frame, faces, score, units over)."""
         current = self._value(loop.score, loop.over)
         found = []
-        for pos, faces, score, over in self._moves(loop, slides, kick):
+        for pos, faces, score, over in self._moves(loop, slides, kick, window):
             value = self._value(score, over)
             if kick or value > current + EPS:
                 found.append((value, pos, faces, score, over))
@@ -520,8 +538,26 @@ class Grower:
         return loop
 
     def _step(self, loop: Loop, slides: tuple[int, ...]) -> Loop | None:
+        if len(loop.faces) <= WINDOW_FACES:
+            return self._step_in(loop, slides, None)
+        # window after window round the loop, staying where the last step was
+        # found: the slides next to one that helped often help too
+        m = len(self._cuts(loop, wide=False))
+        for _ in range(math.ceil(m / WINDOW_CUTS)):
+            if self._out_of_time():
+                return None
+            first = int(self.window_at * m) % m
+            better = self._step_in(loop, slides, (first, WINDOW_CUTS))
+            if better is not None:
+                return better
+            self.window_at = ((first + WINDOW_CUTS) % m) / m
+        return None
+
+    def _step_in(self, loop: Loop, slides: tuple[int, ...], window) -> Loop | None:
         current = self._value(loop.score, loop.over)
-        fitting = self._fitting(loop, self._candidates(loop, slides, kick=False))
+        fitting = self._fitting(
+            loop, self._candidates(loop, slides, kick=False, window=window)
+        )
         for _, start, faces, score, over in fitting[:ASSIGN_TRIES]:
             if over == 0:
                 score = self.accept(start, loop.heading, faces)
@@ -593,7 +629,9 @@ class Grower:
                 if stretched is not None:
                     pool.append(stretched)
             self.deadline = deadline
-            pool = self._distinct(pool)
+            # a seed with sides still over the limit has had its stretch; only
+            # buildable loops go on to kicks, annealing and restarts
+            pool = self._distinct([loop for loop in pool if loop.over == 0])
 
             beam = pool
             while beam and not self._out_of_time():

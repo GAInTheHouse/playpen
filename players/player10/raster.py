@@ -23,6 +23,7 @@ covers it in one go, at the price of a stepped edge along walls that are not lin
 up with the grid.
 """
 
+import itertools
 import math
 import time
 from collections import deque
@@ -35,6 +36,7 @@ from shapely.geometry.polygon import orient
 import src.constants as c
 
 NEIGHBOURS = ((1, 0), (-1, 0), (0, 1), (0, -1))
+WALL_OFFSETS = 4  # grid offsets tried per cell size, wall-aligned ones included
 
 
 def _component(cells: set) -> set:
@@ -244,7 +246,41 @@ def _fit_corners(
     return True
 
 
-def raster_loops(region, polygon, headings, cell_sizes, deadline, corner_budget=None):
+def _offsets(local, low, w, h) -> list[tuple[float, float]]:
+    """Where to start the grid: the usual two offsets (flush with the room's
+    lowest corner, and half a cell in), then offsets that put cell edges on the
+    room's longest walls along the grid's axes, so the outline can run flush
+    along them (the idea of an adaptive lattice, which puts nodes on the walls)."""
+    weight_x: dict[float, float] = {}
+    weight_y: dict[float, float] = {}
+    for (x1, y1), (x2, y2) in itertools.pairwise(local):
+        length = math.hypot(x2 - x1, y2 - y1)
+        if length < 1e-9:
+            continue
+        if abs(x2 - x1) <= 1e-6 * length:  # a wall along the grid's y axis
+            key = round((low[0] - x1) % w, 6) % w
+            weight_x[key] = weight_x.get(key, 0.0) + length
+        elif abs(y2 - y1) <= 1e-6 * length:  # along the x axis
+            key = round((low[1] - y1) % h, 6) % h
+            weight_y[key] = weight_y.get(key, 0.0) + length
+    best_x = sorted(weight_x, key=lambda k: -weight_x[k])[:2]
+    best_y = sorted(weight_y, key=lambda k: -weight_y[k])[:2]
+    out = [(0.0, 0.0), (0.5 * w, 0.5 * h)]
+    for ox in best_x or [0.0]:
+        for oy in best_y or [0.0]:
+            if all(abs(ox - a) > 1e-6 or abs(oy - b) > 1e-6 for a, b in out):
+                out.append((ox, oy))
+    return out[:WALL_OFFSETS]
+
+
+def raster_loops(
+    region,
+    polygon,
+    headings,
+    cell_sizes,
+    deadline,
+    corner_budget=None,
+):
     """Outlines of blocks of grid cells that fill the room, as
     (start, heading, faces), with faces as (heading in 45-degree steps from
     `heading`, length). `region` is the room buffered by the containment
@@ -259,11 +295,11 @@ def raster_loops(region, polygon, headings, cell_sizes, deadline, corner_budget=
         for w, h in cell_sizes:
             most_x = int(c.MAX_FACE_LENGTH // w)
             most_y = int(c.MAX_FACE_LENGTH // h)
-            for shift in (0.0, 0.5):
+            for ox, oy in _offsets(local, low, w, h):
                 if time.process_time() > deadline:
                     return
-                xs = np.arange(low[0] - shift * w, high[0], w)
-                ys = np.arange(low[1] - shift * h, high[1], h)
+                xs = np.arange(low[0] - ox, high[0], w)
+                ys = np.arange(low[1] - oy, high[1], h)
                 gx, gy = np.meshgrid(xs, ys, indexing="ij")
                 x0, y0 = gx.ravel(), gy.ravel()
                 square = np.array([[0, 0], [w, 0], [w, h], [0, h], [0, 0]])

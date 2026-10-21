@@ -1,5 +1,8 @@
 import heapq
 import math
+import random
+import signal
+import sys
 import time
 from collections import Counter
 from itertools import islice
@@ -8,6 +11,7 @@ import src.constants as c
 from players.player0 import Player
 from players.player10.assign import Assigner, Assignment
 from players.player10.beam import free_shapes
+from players.player10.cells import CellSearch, cell_loops
 from players.player10.freeform import (
     MAX_FACES,
     Faces,
@@ -38,6 +42,7 @@ from players.player10.shapes import (
     make_shape,
 )
 from src.enclosure import Construction, score_construction, validate_construction
+from src.limits import CpuLimit
 from src.pieces import Connector, ConnectorType, Piece, PieceType
 
 # CPU seconds the search may use. The simulator allows 300; nothing can interrupt
@@ -47,9 +52,7 @@ from src.pieces import Connector, ConnectorType, Piece, PieceType
 TIME_BUDGET = 270.0
 # how far into the budget each stage of the search may run; growing gets the rest
 RECTANGLE_SHARE = 0.10
-L_SHARE = 0.20
-OCTAGON_SHARE = 0.32
-U_SHARE = 0.42
+U_SHARE = 0.42  # the other families, sharing their time fairly, end here
 SEGMENTED_SHARE = 0.50
 # Filling the room with grid cells (raster.py): the cell sides tried, and the most
 # time it may take. Only sides whose every multiple up to the face limit can be
@@ -57,6 +60,14 @@ SEGMENTED_SHARE = 0.50
 RASTER_SIZES = (5, 6, 7, 8, 9, 10, 12, 15)
 RASTER_PAIRS = 24
 RASTER_SHARE = 0.1  # of the whole budget, at most
+# choosing grid cells under the stock's budget (cells.py), its share of the budget
+CELLS_SHARE = 0.06
+CELL_STEPS = (5,)
+CELLS_SEED = 4444  # the same scenario gives the same search every run
+# only in rooms big enough, or with corners enough, for a block of cells to
+# beat what growing finds: in a small room it only takes growing's time
+CELLS_MIN_AREA = 1000.0
+CELLS_MIN_RIGHTS = 100
 RASTER_MAX_FACES = 900  # piece assignment walks the faces one level deep each
 # Large, highly articulated rooms with abundant stock benefit from comparing all
 # useful grid sizes and room-derived orientations.  This remains conditional so
@@ -130,6 +141,32 @@ def segmented_rectangle(a: int, middle: int, b: int, d: int, h: int) -> Shape:
     )
 
 
+def cpu_limit() -> float:
+    """The CPU seconds the simulator gives this run: the limit of its running
+    timer where one can be read (Unix), else --cpu-limit from the command line,
+    else the simulator's default."""
+    try:
+        handler = (
+            signal.getsignal(signal.SIGPROF) if hasattr(signal, "SIGPROF") else None
+        )
+        owner = getattr(handler, "__self__", None)
+        if isinstance(owner, CpuLimit) and math.isfinite(owner.seconds):
+            return float(owner.seconds)
+    except (OSError, ValueError):
+        pass
+    args = sys.argv[1:]
+    for i, arg in enumerate(args):
+        flag, _, value = arg.partition("=")
+        if flag == "--cpu-limit":
+            try:
+                seconds = float(value if value else args[i + 1])
+            except (ValueError, IndexError):
+                continue
+            if math.isfinite(seconds) and seconds > 0:
+                return seconds
+    return float(c.CPU_TIME_LIMIT_SECONDS)
+
+
 class Player10(Player):
     """Group 10: the best-scoring rectangle, L, U, hexagon or octagon the inventory
     can build, placed against the room's own walls, then grown face by face into
@@ -149,6 +186,12 @@ class Player10(Player):
 
     def _build(self) -> None:
         started = time.process_time()
+        # the simulator's limit may be lower than 300 (it is set per run); leave a
+        # tenth of it, and at least 20 s, for the step in hand when time runs out
+        limit = cpu_limit()
+        budget = min(TIME_BUDGET, limit - max(0.1 * limit, 20.0), limit * 0.9)
+        budget = max(budget, 1.0)
+        self._budget = budget
         weights = self.weights
         self._assigner = Assigner(self.inventory, want_second_gate=weights.G > 0)
         if self._assigner.gates == 0:
@@ -174,32 +217,37 @@ class Player10(Player):
         # cheapest families first, so there is always something to fall back on
         # and a score for the dearer searches to beat. Octagons are slow to rule
         # out; U-shapes are many, and only pay off where nothing else fits.
-        stages = [
-            ([RECTANGLE], RECTANGLE_SHARE),
-            ([L_SHAPE], L_SHARE),
-            ([OCTAGON, HEXAGON], OCTAGON_SHARE),
-            ([U_SHAPE], U_SHARE),
-        ]
-        for stage, share in stages:
-            wanted = [f for f in stage if f in families]
-            if wanted:
-                self._deadline = started + TIME_BUDGET * share
-                self._search([x for f in wanted for x in self._candidates(f, bonus)])
+        if RECTANGLE in families:
+            self._deadline = started + budget * RECTANGLE_SHARE
+            self._search(self._candidates(RECTANGLE, bonus))
+        # the other families share their time fairly: a family whose big shapes
+        # keep failing to fit can't starve one whose best shape is next in line
+        others = [f for f in (L_SHAPE, OCTAGON, HEXAGON, U_SHAPE) if f in families]
+        if others:
+            self._deadline = started + budget * U_SHARE
+            self._search_fair({f: self._candidates(f, bonus) for f in others})
 
-        self._deadline = started + TIME_BUDGET * SEGMENTED_SHARE
+        self._deadline = started + budget * SEGMENTED_SHARE
         self._segmented_rectangles(bonus)
 
         self._raster(
             min(
-                started + TIME_BUDGET * GROW_SHARE,
-                time.process_time() + TIME_BUDGET * RASTER_SHARE,
+                started + budget * GROW_SHARE,
+                time.process_time() + budget * RASTER_SHARE,
+            )
+        )
+
+        self._cells(
+            min(
+                started + budget * GROW_SHARE,
+                time.process_time() + budget * CELLS_SHARE,
             )
         )
 
         if dense_raster:
             self._raster(
                 min(
-                    started + TIME_BUDGET * 0.58,
+                    started + budget * 0.58,
                     time.process_time() + DENSE_RASTER_SECONDS,
                 ),
                 headings=self._search_room.base_headings(90),
@@ -211,10 +259,10 @@ class Player10(Player):
         self._deadline = time.process_time() + BEAM_SECONDS
         self._freeform(bonus)
 
-        self._grow(started + TIME_BUDGET * FIRST_GROW_SHARE)
+        self._grow(started + budget * FIRST_GROW_SHARE)
 
         # a deeper walk along the walls where the best so far leaves a large gap
-        extra_end = started + TIME_BUDGET * GROW_SHARE
+        extra_end = started + budget * GROW_SHARE
         if not dense_raster and self._small_stock_search_worthwhile():
             self._small_stock_boundary(
                 extra_end, widths=SMALL_STOCK_WIDTHS, diverse_beam=True
@@ -223,9 +271,9 @@ class Player10(Player):
             self._extended_boundary(extra_end)
 
         # the rest of the time grows again, from the best loop found so far
-        self._grow(started + TIME_BUDGET * GROW_SHARE, from_best=True)
+        self._grow(started + budget * GROW_SHARE, from_best=True)
 
-        self._deadline = started + TIME_BUDGET
+        self._deadline = started + budget
         self._polish(bonus)
 
         if self._best is None and not self.note:
@@ -673,6 +721,53 @@ class Player10(Player):
                 if assignment is not None:
                     self._try(shape, assignment)
 
+    def _search_fair(self, by_family: dict[str, list[Candidate]]) -> None:
+        """Like `_search`, for several families at once: each family's shapes
+        are tried from its highest score down, and the next turn always goes to
+        the family that has had the least time so far. A family is done when its
+        best shape is placed or nothing of it could beat the best so far."""
+        heaps = {}
+        for family, candidates in by_family.items():
+            heap = [(-s, i, f, p, False) for i, (s, f, p) in enumerate(candidates)]
+            if heap:
+                heapq.heapify(heap)
+                heaps[family] = heap
+        spent = dict.fromkeys(heaps, 0.0)
+        counter = sum(len(h) for h in heaps.values())
+        while heaps and time.process_time() <= self._deadline:
+            family = min(heaps, key=lambda f: spent[f])
+            heap = heaps[family]
+            began = time.process_time()
+            done = self._search_step(heap, counter)
+            counter += 1
+            spent[family] += time.process_time() - began
+            if done or not heap:
+                del heaps[family]
+
+    def _search_step(self, heap: list, counter: int) -> bool:
+        """One candidate off the heap. True when the family is finished: its
+        best shape is placed, or its next could not beat the best so far."""
+        negative, _, family, params, exact = heapq.heappop(heap)
+        if -negative <= self._best_score:
+            return True
+        if self._cannot_fit(family, params):
+            return False
+        shape = make_shape(family, params)
+        assignment = self._assigner.assign(shape.faces)
+        if assignment is None:
+            return False
+        if not exact:
+            score = self._score(shape.area, shape.perimeter)
+            if assignment.gate_faces >= 2:
+                score += self.weights.G
+            if score < -negative - 1e-9:
+                heapq.heappush(heap, (-score, counter, family, params, True))
+                return False
+        if self._try(shape, assignment):
+            return True
+        self._note_failure(family, params)
+        return False
+
     def _cannot_fit(self, family: str, params: tuple[int, ...]) -> bool:
         """Cheap reasons a shape can't be placed, tried before the real search."""
         if inner_radius(family, params) > self._search_room.inradius:
@@ -777,6 +872,9 @@ class Player10(Player):
             pairs = pairs[:pair_limit]
         if headings is None:
             headings = self._search_room.base_headings(90)[:2]
+            main = self._search_room.main_direction()
+            if all(abs((main - h + 45) % 90 - 45) > 0.5 for h in headings):
+                headings = headings + [main]
         for start, heading, faces in raster_loops(
             self._search_room.region,
             self.room.polygon,
@@ -803,6 +901,42 @@ class Player10(Player):
             # it fills the room, and growing can add the diagonals it lacks
             if score is not None and len(faces) <= self._grow_max_faces:
                 self._grid_seeds.append(Loop(start, heading, tuple(faces), score))
+
+    def _cells(self, deadline: float) -> None:
+        """Outlines of grid cells chosen under the stock's budget (see cells.py):
+        where wall or corners run short, the best block of cells is often not
+        the whole room trimmed down."""
+        rights = self.inventory.connectors.get(ConnectorType.RIGHT, 0)
+        lengths = set(self._assigner.lengths)
+        steps = [s for s in CELL_STEPS if s in lengths] or [min(lengths)]
+        if rights < 4:
+            return
+        if self.room.polygon.area < CELLS_MIN_AREA and rights < CELLS_MIN_RIGHTS:
+            return
+        search = CellSearch(
+            lengths,
+            min(rights, RASTER_MAX_FACES),
+            self._assigner.total_length,
+            self.weights.A,
+            self.weights.C,
+            lambda sides: self._assigner.assign(sides) is not None,
+            random.Random(CELLS_SEED),
+        )
+        for start, heading, faces in cell_loops(
+            self._search_room.region,
+            self.room.polygon,
+            self._search_room.base_headings(90),
+            steps,
+            search,
+            deadline,
+        ):
+            perimeter = sum(n for _, n in faces)
+            area = area_of(corners((0.0, 0.0), faces))
+            if self._score(area, perimeter) + self._bonus <= self._best_score:
+                continue
+            score = self._accept_loop(start, heading, faces)
+            if score is not None and len(faces) <= self._grow_max_faces:
+                self._grid_seeds.append(Loop(start, heading, faces, score))
 
     def _freeform(self, bonus: float) -> None:
         """Free-form polygons from the beam search, best-ranked first."""
