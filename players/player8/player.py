@@ -47,6 +47,8 @@ DOMINANCE_OK = {
     "hex",
     "L",
     "T",
+    "stair",
+    "stair2",
 }  # larger parameters contain the smaller shape
 # Random restarts keep paying off late (improvements measured at restart
 # 20,000+ on some rooms), so the caps are generous; on this machine a room
@@ -62,6 +64,9 @@ EXACT_MAX_ANGLES = 32  # rotations tested exactly per shape (longest walls first
 EXACT_FAST_CHECKS = 1500  # anchored poses tried before the exact pass
 EXACT_COST = 25  # containment checks charged per room edge of an exact fit test
 MAX_FAILED_MEMO = 400
+# families walked after all the others (their own best-first segment), so a
+# large new family can never starve the proven ones of the template budget
+LATE_FAMILIES = {"stair", "stair2"}
 MAX_PARTS = 6  # pieces on one face: 30 / 5
 NODE_LIMIT = 4000  # backtracking budget for one allocation
 RELAX_MAX_SIDES = 24  # the cheap feasibility check is only trusted up to this
@@ -268,6 +273,23 @@ def step_shape(a, b, c, d):
     )
 
 
+def stair(p, q, c, s):
+    """A p-wide block with its top-right corner cut by a diagonal c and its
+    bottom-left corner cut by a diagonal c followed by a straight s: the two
+    steps hug a wall that is steeper than 45 degrees (3 right and 4 diagonal
+    connectors, one of them reflex)."""
+    return Shape(
+        "stair", (p, q, c, s), [4, 6, 7, 6, 0, 2, 3], [p, q, c, s, p, q + s, c]
+    )
+
+
+def stair2(p, q, c, s):
+    """The mirror image of `stair` (the placer rotates but never mirrors)."""
+    return Shape(
+        "stair2", (p, q, c, s), [5, 6, 0, 2, 1, 2, 4], [c, q + s, p, s, c, q, p]
+    )
+
+
 def band(s, k, d, h):
     """A strip h high whose two long sides are k+1 runs of s separated by k
     inward V-dips with legs d (two diagonal connectors and one reflex right
@@ -313,6 +335,8 @@ TEMPLATES = {
     "step": step_shape,
     "band": band,
     "band2": band2,
+    "stair": stair,
+    "stair2": stair2,
 }
 
 # --- piece allocation ---------------------------------------------------------
@@ -798,16 +822,19 @@ class Placer:
         self.checks += (
             EXACT_COST * len(self.edges) * (1 if convex else max(1, len(pts) // 4))
         )
-        region = self.feasible(pts, convex)
-        if region.is_empty:
-            c = Polygon(pts).representative_point()
-            r = max(math.hypot(x - c.x, y - c.y) for x, y in pts) or 1.0
-            f = 1.0 - 0.9 * TOL / r
-            shrunk = [(c.x + (x - c.x) * f, c.y + (y - c.y) * f) for x, y in pts]
-            region = self.feasible(shrunk, convex)
+        try:
+            region = self.feasible(pts, convex)
             if region.is_empty:
-                return None
-        t = region.representative_point()
+                c = Polygon(pts).representative_point()
+                r = max(math.hypot(x - c.x, y - c.y) for x, y in pts) or 1.0
+                f = 1.0 - 0.9 * TOL / r
+                shrunk = [(c.x + (x - c.x) * f, c.y + (y - c.y) * f) for x, y in pts]
+                region = self.feasible(shrunk, convex)
+                if region.is_empty:
+                    return None
+            t = region.representative_point()
+        except Exception:  # noqa: BLE001 - a geometry error on a pathological room is "no fit here"
+            return None
         # prefer a pose on the room's integer lattice in this rotation (flush
         # with walls, which is what later bump growth needs), else the point
         vx, vy = self.pts[0]
@@ -1959,6 +1986,7 @@ class Player8(Player):
         self._refined = set()  # seeds that have already been grown
         self._posed = set()  # (shape, pose) pairs already grown
         self._cands = None  # template candidates, worked through in order
+        self._rect_fit_memo = {}  # (a, b) -> whether an a x b rectangle fits the room
         self._next = 0
         self._restarts = 0
         self.upper_bound = self._upper_bound()
@@ -2078,7 +2106,6 @@ class Player8(Player):
         if not lengths:
             return []
         buildable = set(lengths)
-        minx, miny, maxx, maxy = self.room.polygon.bounds
         room_diag = self.placer.diameter + 1e-6  # the room's true diameter
         room_area = self.room.polygon.area + 1e-6
         right, diag = self.conn["right"], self.conn["diagonal"]
@@ -2217,6 +2244,39 @@ class Player8(Player):
                                 dm,
                                 min(c, d) / 2,
                             )
+        if right >= 3 and diag >= 4:
+            # staircase corners: a diagonal plus a straight hug walls steeper than 45 degrees
+            for p_ in lengths:
+                for q in lengths:
+                    for s_ in lengths:
+                        if q + s_ not in buildable:
+                            continue
+                        if not self._rect_fits(p_, q + s_):
+                            continue  # the stair contains a p x (q + s) rectangle
+                        for c in lengths:
+                            if c > 10:
+                                break
+                            k = c * r2
+                            area = (p_ + k) * (q + s_ + k) - c * s_ * r2 - c * c / 2
+                            per = 2 * (p_ + q + s_ + c)
+                            # true diameter over the seven vertices
+                            pts = [
+                                (0.0, 0.0),
+                                (-p_, 0.0),
+                                (-p_, -q),
+                                (-p_ + k, -q - k),
+                                (-p_ + k, -q - k - s_),
+                                (k, -q - k - s_),
+                                (k, -k),
+                            ]
+                            dm = max(
+                                math.hypot(x1 - x0, y1 - y0)
+                                for i, (x0, y0) in enumerate(pts)
+                                for x1, y1 in pts[i + 1 :]
+                            )
+                            r = min(p_, q) / 2
+                            add("stair", (p_, q, c, s_), area, per, dm, r)
+                            add("stair2", (p_, q, c, s_), area, per, dm, r)
         # bands: long thin shapes whose faces are kept under 30 by V-dips
         for k in (1, 2, 3, 4):
             if right < 4 + 2 * k or diag < 4 * k:
@@ -2265,7 +2325,7 @@ class Player8(Player):
                                 math.hypot(w, h),
                                 min(s1, s2, h) / 2,
                             )
-        out.sort(key=lambda t: -t[0])
+        out.sort(key=lambda t: (t[1] in LATE_FAMILIES, -t[0]))
         return out
 
     def _templates(self, work):
@@ -2278,15 +2338,20 @@ class Player8(Player):
         if self._cands is None:
             self._cands = self._template_candidates()
             self._next = 0
+            first_late = next(
+                (i for i, c in enumerate(self._cands) if c[1] in LATE_FAMILIES),
+                len(self._cands),
+            )
+            self._seg_ends = sorted({first_late, len(self._cands)})
             self._failed = {}  # family -> minimal parameter sets that didn't fit
             self._lengths_sorted = self._side_lengths()
         spent = self.placer.checks
         while self._next < len(self._cands):
             bound, family, params = self._cands[self._next]
             if bound <= self.best_score:
-                # sorted, so nothing left can win
-                self._next = len(self._cands)
-                return
+                # best first within its segment, so skip to the next segment
+                self._next = next(e for e in self._seg_ends if e > self._next)
+                continue
             if self._done() or self.placer.checks - spent > work:
                 return
             self._next += 1
@@ -2373,6 +2438,16 @@ class Player8(Player):
         if len(memo) < MAX_FAILED_MEMO:
             memo.append(key)
 
+    def _rect_fits(self, a, b):
+        """Whether an a x b rectangle fits somewhere in the room (memoised): a
+        template that contains such a rectangle cannot fit when it does not."""
+        key = (min(a, b), max(a, b))
+        hit = self._rect_fit_memo.get(key)
+        if hit is None:
+            hit = self.placer.place(TEMPLATES["rect"](*key)) is not None
+            self._rect_fit_memo[key] = hit
+        return hit
+
     # the room itself
 
     def _room_trace(self):
@@ -2381,8 +2456,15 @@ class Player8(Player):
         in a room of short walls nothing beats following them."""
         polys = [self.room.polygon]
         for k in (1, 2, 3):
-            inset = self.room.polygon.buffer(-k, join_style=2)
-            if not inset.is_empty and inset.geom_type == "Polygon":
+            try:
+                inset = self.room.polygon.buffer(-k, join_style=2)
+            except Exception:  # noqa: BLE001 - an inset that cannot be built is simply not a candidate
+                inset = None
+            if (
+                inset is not None
+                and not inset.is_empty
+                and inset.geom_type == "Polygon"
+            ):
                 polys.append(inset)
         for poly in polys:
             pts = list(poly.exterior.coords)[:-1]
@@ -2398,12 +2480,12 @@ class Player8(Player):
                 if abs(turn - round(turn)) > 1e-4 or abs(length - round(length)) > 1e-6:
                     ok = False
                     break
-                d = int(round(turn)) % 8
+                d = round(turn) % 8
                 if dirs and dirs[-1] == d:  # a collinear corner: one side
-                    lengths[-1] += int(round(length))
+                    lengths[-1] += round(length)
                 else:
                     dirs.append(d)
-                    lengths.append(int(round(length)))
+                    lengths.append(round(length))
             if not ok or len(dirs) < 4:
                 continue
             if dirs[0] == dirs[-1]:  # the first and last side are one side
