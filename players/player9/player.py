@@ -227,8 +227,9 @@ class Player9(Player):
         centers.append((rp.x, rp.y))
         for i in range(1, 10):
             for j in range(1, 10):
-                centers.append((minx + (maxx - minx) * i / 10,
-                                miny + (maxy - miny) * j / 10))
+                centers.append(
+                    (minx + (maxx - minx) * i / 10, miny + (maxy - miny) * j / 10)
+                )
 
         def placement(vertices):
             local = Polygon(vertices)
@@ -262,19 +263,28 @@ class Player9(Player):
         def templates():
             gens = []
             if right >= 4:
-                gens.append(("rectangle", (a, b, a, b))
-                            for a, b in product(lengths_avail, repeat=2) if a <= b)
+                gens.append(
+                    ("rectangle", (a, b, a, b))
+                    for a, b in product(lengths_avail, repeat=2)
+                    if a <= b
+                )
             if right >= 2 and diagonal >= 4:
-                gens.append(("hexagon", (a, b, c, a, b, c))
-                            for a, b, c in product(lengths_avail, repeat=3))
+                gens.append(
+                    ("hexagon", (a, b, c, a, b, c))
+                    for a, b, c in product(lengths_avail, repeat=3)
+                )
             if diagonal >= 8:
-                gens.append(("octagon", (a, b, c, d, a, b, c, d))
-                            for a, b, c, d in product(lengths_avail, repeat=4)
-                            if a <= c)
+                gens.append(
+                    ("octagon", (a, b, c, d, a, b, c, d))
+                    for a, b, c, d in product(lengths_avail, repeat=4)
+                    if a <= c
+                )
             if right >= 6:
-                gens.append(("L-shape", (a + b, c, b, d, a, c + d))
-                            for a, b, c, d in product(lengths_avail, repeat=4)
-                            if a + b in faces and c + d in faces)
+                gens.append(
+                    ("L-shape", (a + b, c, b, d, a, c + d))
+                    for a, b, c, d in product(lengths_avail, repeat=4)
+                    if a + b in faces and c + d in faces
+                )
             gens = [g for g in gens]
             while gens:
                 for g in gens[:]:
@@ -287,7 +297,9 @@ class Player9(Player):
         rw, rh = maxx - minx, maxy - miny
         room_bb_lo, room_bb_hi = min(rw, rh), max(rw, rh)
         candidates = []
-        gen_deadline = time.process_time() + max(0.5, (deadline - time.process_time()) * 0.2)
+        gen_deadline = time.process_time() + max(
+            0.5, (deadline - time.process_time()) * 0.2
+        )
         for family, sides in templates():
             if time.process_time() >= gen_deadline:
                 break
@@ -324,8 +336,11 @@ class Player9(Player):
             shape = Polygon(vertices)
             if not shape.is_valid or shape.area <= 0:
                 continue
-            if any(math.hypot(x - xx, y - yy) > room_diag + TOL
-                   for x, y in vertices for xx, yy in vertices):
+            if any(
+                math.hypot(x - xx, y - yy) > room_diag + TOL
+                for x, y in vertices
+                for xx, yy in vertices
+            ):
                 continue
             assemblies = None
             if self.weights.G > 0:
@@ -334,8 +349,13 @@ class Player9(Player):
                 assemblies = allocate(sides, 1)
             if assemblies is None:
                 continue
-            bonus = sum(any(types[i].is_gate and n for i, n in enumerate(face))
-                        for face in assemblies) >= 2
+            bonus = (
+                sum(
+                    any(types[i].is_gate and n for i, n in enumerate(face))
+                    for face in assemblies
+                )
+                >= 2
+            )
             if base + (self.weights.G if bonus else 0) <= best_score:
                 continue
             found = placement(vertices)
@@ -345,9 +365,14 @@ class Player9(Player):
             for usage, turn in zip(assemblies, turns):
                 face = [p for p, n in zip(types, usage) for _ in range(n)]
                 pieces.extend(face)
-                conns.append(Connector(
-                    ConnectorType.RIGHT if abs(turn) == 90 else ConnectorType.DIAGONAL,
-                    reflex=turn < 0))
+                conns.append(
+                    Connector(
+                        ConnectorType.RIGHT
+                        if abs(turn) == 90
+                        else ConnectorType.DIAGONAL,
+                        reflex=turn < 0,
+                    )
+                )
                 conns.extend(Connector(ConnectorType.STRAIGHT) for _ in face[1:])
             start, heading = found
             cons = Construction(start, heading, pieces, conns)
@@ -457,8 +482,9 @@ class Player9(Player):
                 placed = False
                 for ox in range(minx, maxx - ow + 1, step):
                     for oy in range(miny, maxy - oh + 1, step):
-                        rect = _P([(ox, oy), (ox + ow, oy),
-                                   (ox + ow, oy + oh), (ox, oy + oh)])
+                        rect = _P(
+                            [(ox, oy), (ox + ow, oy), (ox + ow, oy + oh), (ox, oy + oh)]
+                        )
                         if not pr.contains(rect):
                             continue
                         built = self._trace_polygon(rect)
@@ -501,12 +527,19 @@ class Player9(Player):
         # from inventory (a leg must be one buildable wall; segments/caps may be
         # multi-piece runs). cache buildability of integer lengths.
         def buildable_run(L):
-            return self._tile_run(L, dict(self.inventory.walls),
-                                  dict(self.inventory.gates), False) is not None
+            return (
+                self._tile_run(
+                    L, dict(self.inventory.walls), dict(self.inventory.gates), False
+                )
+                is not None
+            )
 
         # leg must be a SINGLE diagonal wall whose length exists in stock
-        leg_lengths = sorted(L for L, c in self.inventory.walls.items()
-                             if c > 0 and 5 <= L <= MAX_FACE_LENGTH)
+        leg_lengths = sorted(
+            L
+            for L, c in self.inventory.walls.items()
+            if c > 0 and 5 <= L <= MAX_FACE_LENGTH
+        )
         if not leg_lengths:
             return None
 
@@ -523,8 +556,9 @@ class Player9(Player):
                 return (minx + u, miny + v)
             return (minx + v, miny + u)
 
-        seg_choices = [s for s in (6, 10, 12, 15, 18, 20, 24, 25, 30)
-                       if buildable_run(s)]
+        seg_choices = [
+            s for s in (6, 10, 12, 15, 18, 20, 24, 25, 30) if buildable_run(s)
+        ]
         if not seg_choices:
             return None
 
@@ -574,8 +608,9 @@ class Player9(Player):
                     span = max(0.0, start_hi - start_lo)
                     offsets = {start_lo, start_lo + span / 2, start_hi}
                     for s0 in sorted(offsets):
-                        verts = self._band_vertices(s0, inset, H, depth, seg,
-                                                    n, to_world, both)
+                        verts = self._band_vertices(
+                            s0, inset, H, depth, seg, n, to_world, both
+                        )
                         if verts is None:
                             continue
                         try:
@@ -607,16 +642,16 @@ class Player9(Player):
         vt = inset + H
         pts = []
         u = s0
-        pts.append((u, v0))        # bottom-left cap
+        pts.append((u, v0))  # bottom-left cap
         u += seg
         pts.append((u, v0))
         for _ in range(n):
-            pts.append((u + depth, v0 + depth))   # up the leg (into band)
-            pts.append((u + 2 * depth, v0))       # back down to edge
+            pts.append((u + depth, v0 + depth))  # up the leg (into band)
+            pts.append((u + 2 * depth, v0))  # back down to edge
             u += 2 * depth
             u += seg
             pts.append((u, v0))
-        pts.append((u, vt))        # right cap (vertical, RIGHT corner)
+        pts.append((u, vt))  # right cap (vertical, RIGHT corner)
         u_right = u
         if both:
             u2 = u_right - seg
@@ -654,8 +689,11 @@ class Player9(Player):
         cx0, cy0 = (minx + maxx) / 2.0, (miny + maxy) / 2.0
         span = max(maxx - minx, maxy - miny)
 
-        gate_lengths = sorted(L for L, cnt in self.inventory.gates.items()
-                              if cnt > 0 and 5 <= L <= MAX_FACE_LENGTH)
+        gate_lengths = sorted(
+            L
+            for L, cnt in self.inventory.gates.items()
+            if cnt > 0 and 5 <= L <= MAX_FACE_LENGTH
+        )
         if not gate_lengths:
             return None
         gmin = gate_lengths[0]
@@ -663,9 +701,12 @@ class Player9(Player):
         # edge builders: split an integer edge length into wall pieces <= 30,
         # optionally seating one gate. returns list[(PieceType, L)] or None.
         def build_edge(total, want_gate):
-            return self._tile_run(int(round(total)),
-                                  dict(self.inventory.walls),
-                                  dict(self.inventory.gates), want_gate)
+            return self._tile_run(
+                int(round(total)),
+                dict(self.inventory.walls),
+                dict(self.inventory.gates),
+                want_gate,
+            )
 
         # templates: each returns a ring of (length, turn_sign). lengths are
         # parametrised by integer dims. turn_sign +1 convex(90), -1 reflex(270).
@@ -674,9 +715,20 @@ class Player9(Player):
 
         def tmpl_plus(arm, th):
             # a symmetric plus: arm length `arm`, bar thickness `th`.
-            return [(th, +1), (arm, +1), (th, -1), (arm, +1),
-                    (th, +1), (arm, +1), (th, -1), (arm, +1),
-                    (th, +1), (arm, +1), (th, -1), (arm, +1)]
+            return [
+                (th, +1),
+                (arm, +1),
+                (th, -1),
+                (arm, +1),
+                (th, +1),
+                (arm, +1),
+                (th, -1),
+                (arm, +1),
+                (th, +1),
+                (arm, +1),
+                (th, -1),
+                (arm, +1),
+            ]
 
         def tmpl_pinwheel_p10(a, b, s, c_):
             # topology of p10's star winner: lens [a,b,s,s,c,s,s,s,c,s,s,b] with
@@ -731,8 +783,11 @@ class Player9(Player):
         step = 2.0
         rng = max(step, span * 0.25)
         n_off = int(rng / step)
-        offs = [0.0] + [k * step for k in range(1, n_off + 1)] \
+        offs = (
+            [0.0]
+            + [k * step for k in range(1, n_off + 1)]
             + [-k * step for k in range(1, n_off + 1)]
+        )
 
         best = None
         best_score = float("-inf")
@@ -741,6 +796,7 @@ class Player9(Player):
         # coarse round on a lucky offset -- the true optimum may belong to a
         # template whose coarse-grid score was slightly lower.
         import heapq
+
         topk = []  # (score, tiebreak, ring, rot, ox, oy)
         tie = 0
         for ring in closed:
@@ -752,7 +808,8 @@ class Player9(Player):
                 for ox in offs:
                     for oy in offs:
                         cons = self._ring_to_construction(
-                            ring, rot, cx0 + ox, cy0 + oy, build_edge, gmin)
+                            ring, rot, cx0 + ox, cy0 + oy, build_edge, gmin
+                        )
                         if cons is None:
                             continue
                         sc = self._score_cons(cons)
@@ -774,7 +831,8 @@ class Player9(Player):
             for dx in fine:
                 for dy in fine:
                     cons = self._ring_to_construction(
-                        ring, rot, cx0 + ox0 + dx, cy0 + oy0 + dy, build_edge, gmin)
+                        ring, rot, cx0 + ox0 + dx, cy0 + oy0 + dy, build_edge, gmin
+                    )
                     if cons is None:
                         continue
                     sc = self._score_cons(cons)
@@ -794,8 +852,11 @@ class Player9(Player):
         # fall back to any edge that can hold the smallest gate with a buildable
         # remainder. `build_edge` does the real tiling/inventory check, so we
         # just pick a reasonable candidate order here.
-        gate_set = {L for L, cnt in self.inventory.gates.items()
-                    if cnt > 0 and 5 <= L <= MAX_FACE_LENGTH}
+        gate_set = {
+            L
+            for L, cnt in self.inventory.gates.items()
+            if cnt > 0 and 5 <= L <= MAX_FACE_LENGTH
+        }
         gate_edge = None
         for i, (L, _) in enumerate(ring):
             if int(round(L)) in gate_set:
@@ -838,6 +899,7 @@ class Player9(Player):
 
         # walk from origin at heading rot, then translate to center on (cx, cy)
         from src.enclosure import build_geometry as _bg
+
         trial = Construction((0.0, 0.0), float(rot), pieces, conns)
         try:
             verts, pos_gap, head_gap = _bg(trial)
@@ -906,9 +968,13 @@ class Player9(Player):
     def _integer_vertices(lengths, turns):
         """Check the shape actually closes back to its start, then return its
         corner points. Returns None if the sides don't form a closed loop."""
-        if (len(lengths) != len(turns) or sum(turns) != 360
-                or any(not isinstance(n, int) or not 5 <= n <= MAX_FACE_LENGTH
-                       for n in lengths)):
+        if (
+            len(lengths) != len(turns)
+            or sum(turns) != 360
+            or any(
+                not isinstance(n, int) or not 5 <= n <= MAX_FACE_LENGTH for n in lengths
+            )
+        ):
             return None
         ax = ay = dx_ = dy_ = 0
         direction = 0
@@ -993,8 +1059,12 @@ class Player9(Player):
 
         def fits(coords):
             poly = Polygon(coords)
-            return poly.is_valid and poly.area > 0 and poly.exterior.is_simple \
+            return (
+                poly.is_valid
+                and poly.area > 0
+                and poly.exterior.is_simple
                 and prepared.contains(poly)
+            )
 
         # ---- greedy grow: seed a small box at many points, then push each of
         # its four edges outward until it hits a wall. this scales as O(room)
@@ -1015,8 +1085,8 @@ class Player9(Player):
                     # priority orders per seed and keep the best of each.
                     orders = (
                         ("L", "R", "D", "U"),  # balanced
-                        ("L", "R"),            # width-first, then all
-                        ("D", "U"),            # height-first, then all
+                        ("L", "R"),  # width-first, then all
+                        ("D", "U"),  # height-first, then all
                     )
                     for order in orders:
                         if time.process_time() >= deadline:
@@ -1030,14 +1100,26 @@ class Player9(Player):
                                 if time.process_time() >= deadline:
                                     return
                                 improved = False
-                                if "L" in dirs and fits([(x0 - gs, y0), (x1, y0), (x1, y1), (x0 - gs, y1)]):
-                                    x0 -= gs; improved = True
-                                if "R" in dirs and fits([(x0, y0), (x1 + gs, y0), (x1 + gs, y1), (x0, y1)]):
-                                    x1 += gs; improved = True
-                                if "D" in dirs and fits([(x0, y0 - gs), (x1, y0 - gs), (x1, y1), (x0, y1)]):
-                                    y0 -= gs; improved = True
-                                if "U" in dirs and fits([(x0, y0), (x1, y0), (x1, y1 + gs), (x0, y1 + gs)]):
-                                    y1 += gs; improved = True
+                                if "L" in dirs and fits(
+                                    [(x0 - gs, y0), (x1, y0), (x1, y1), (x0 - gs, y1)]
+                                ):
+                                    x0 -= gs
+                                    improved = True
+                                if "R" in dirs and fits(
+                                    [(x0, y0), (x1 + gs, y0), (x1 + gs, y1), (x0, y1)]
+                                ):
+                                    x1 += gs
+                                    improved = True
+                                if "D" in dirs and fits(
+                                    [(x0, y0 - gs), (x1, y0 - gs), (x1, y1), (x0, y1)]
+                                ):
+                                    y0 -= gs
+                                    improved = True
+                                if "U" in dirs and fits(
+                                    [(x0, y0), (x1, y0), (x1, y1 + gs), (x0, y1 + gs)]
+                                ):
+                                    y1 += gs
+                                    improved = True
 
                         # grow the prioritized directions first, then everything,
                         # coarse then fine, to maximize the final rectangle.
@@ -1050,15 +1132,20 @@ class Player9(Player):
                             cmax = min(w, h) // 2
                             for c in (cmax, cmax // 2, 5):
                                 if 2 <= c <= cmax:
-                                    consider([
-                                        (x0 + c, y0), (x1 - c, y0),
-                                        (x1, y0 + c), (x1, y1 - c),
-                                        (x1 - c, y1), (x0 + c, y1),
-                                        (x0, y1 - c), (x0, y0 + c),
-                                    ])
+                                    consider(
+                                        [
+                                            (x0 + c, y0),
+                                            (x1 - c, y0),
+                                            (x1, y0 + c),
+                                            (x1, y1 - c),
+                                            (x1 - c, y1),
+                                            (x0 + c, y1),
+                                            (x0, y1 - c),
+                                            (x0, y0 + c),
+                                        ]
+                                    )
 
         return best
-
 
     def _connector_for_angle(self, interior: float):
         """Map a corner interior angle (deg) to the connector that reproduces it."""
@@ -1082,14 +1169,12 @@ class Player9(Player):
         inside), tiling each edge from a shared inventory and matching each
         corner's connector. Material is usually plentiful, so we try the FULL
         outline first, then progressively larger insets only if needed."""
-        from shapely.geometry import Polygon as _Poly
 
         base_poly = self.room.polygon
         # try the exact outline first, then inward buffers (keeps the shape,
         # unlike scaling toward the centroid which distorts a concave room).
         for inset in (0.0, 0.05, 0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0):
-            poly = base_poly if inset == 0.0 else base_poly.buffer(-inset,
-                                                                   join_style=2)
+            poly = base_poly if inset == 0.0 else base_poly.buffer(-inset, join_style=2)
             if poly.is_empty or poly.geom_type != "Polygon":
                 continue
             built = self._trace_polygon(poly)
@@ -1158,6 +1243,7 @@ class Player9(Player):
         # loop is still all 90-degree corners (just at a rotated base heading),
         # which _trace_rectilinear builds directly.
         import math as _m
+
         room_corners = list(room.exterior.coords)[:-1]
         angles = {0.0}
         for i in range(len(room_corners)):
@@ -1209,13 +1295,15 @@ class Player9(Player):
 
         def pinches(cells, around=None):
             found = []
-            for x, y in (around if around is not None else cells):
+            for x, y in around if around is not None else cells:
                 if (x, y) not in cells:
                     continue
                 for dx, dy in ((1, 1), (1, -1)):
-                    if ((x + dx, y + dy) in cells
-                            and (x + dx, y) not in cells
-                            and (x, y + dy) not in cells):
+                    if (
+                        (x + dx, y + dy) in cells
+                        and (x + dx, y) not in cells
+                        and (x, y + dy) not in cells
+                    ):
                         found.append((x, y))
             return found
 
@@ -1268,8 +1356,9 @@ class Player9(Player):
                         cell = run[k]
                         cells.discard(cell)
                         x, y = cell
-                        near = [(x + dx, y + dy)
-                                for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
+                        near = [
+                            (x + dx, y + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+                        ]
                         if not pinches(cells, near) and connected(cells):
                             break
                         cells.add(cell)
@@ -1279,6 +1368,7 @@ class Player9(Player):
 
         minx, miny, maxx, maxy = room.bounds
         from shapely import affinity
+
         for rot in rot_angles:
             if time.process_time() >= deadline:
                 break
@@ -1325,9 +1415,15 @@ class Player9(Player):
                             continue
                         if not break_long_sides(cells, most_x, most_y):
                             continue
-                        boxes = [_box(ox + a * w, oy + b * h,
-                                      ox + (a + 1) * w, oy + (b + 1) * h)
-                                 for a, b in cells]
+                        boxes = [
+                            _box(
+                                ox + a * w,
+                                oy + b * h,
+                                ox + (a + 1) * w,
+                                oy + (b + 1) * h,
+                            )
+                            for a, b in cells
+                        ]
                         block = unary_union(boxes)
                         if block.geom_type != "Polygon" or block.interiors:
                             continue
@@ -1379,10 +1475,12 @@ class Player9(Player):
         rights = self.inventory.connectors.get(ConnectorType.RIGHT, 0)
         diagonals = self.inventory.connectors.get(ConnectorType.DIAGONAL, 0)
 
-        wall_lengths = sorted(L for L, n in self.inventory.walls.items()
-                              if n > 0 and 5 <= L <= 30)
-        gate_lengths = sorted(L for L, n in self.inventory.gates.items()
-                              if n > 0 and 5 <= L <= 30)
+        wall_lengths = sorted(
+            L for L, n in self.inventory.walls.items() if n > 0 and 5 <= L <= 30
+        )
+        gate_lengths = sorted(
+            L for L, n in self.inventory.gates.items() if n > 0 and 5 <= L <= 30
+        )
         if not gate_lengths or (rights < 4 and diagonals < 4):
             return None
         all_lengths = sorted(set(wall_lengths) | set(gate_lengths))
@@ -1398,12 +1496,17 @@ class Player9(Player):
                     break
         if not buildable:
             return None
-        total_length = (sum(L * n for L, n in self.inventory.walls.items())
-                        + sum(L * n for L, n in self.inventory.gates.items()))
+        total_length = sum(L * n for L, n in self.inventory.walls.items()) + sum(
+            L * n for L, n in self.inventory.gates.items()
+        )
 
         def score_fn(area, perimeter):
-            return (BASELINE_SCORE + self.weights.A * area
-                    + self.weights.C * perimeter + max(self.weights.G, 0.0))
+            return (
+                BASELINE_SCORE
+                + self.weights.A * area
+                + self.weights.C * perimeter
+                + max(self.weights.G, 0.0)
+            )
 
         def faces_to_cons(start, heading, faces):
             n = len(faces)
@@ -1411,10 +1514,15 @@ class Player9(Player):
                 return None
             walls = dict(self.inventory.walls)
             gates = dict(self.inventory.gates)
-            cap = [i for i in range(n)
-                   if any(gl <= faces[i][1] and
-                          (faces[i][1] - gl == 0 or faces[i][1] - gl >= 5)
-                          for gl in gate_lengths)]
+            cap = [
+                i
+                for i in range(n)
+                if any(
+                    gl <= faces[i][1]
+                    and (faces[i][1] - gl == 0 or faces[i][1] - gl >= 5)
+                    for gl in gate_lengths
+                )
+            ]
             if not cap:
                 return None
             gate_faces = {cap[0]}
@@ -1437,16 +1545,16 @@ class Player9(Player):
                     corner = Connector(ConnectorType.DIAGONAL, True)
                 else:
                     return None
-                segs = self._tile_run(int(round(length)), walls, gates,
-                                      i in gate_faces)
+                segs = self._tile_run(int(round(length)), walls, gates, i in gate_faces)
                 if segs is None:
                     return None
                 for k, (ptype, L) in enumerate(segs):
                     if L < 5:
                         return None  # safety: never emit a sub-5 piece
                     pieces.append(Piece(ptype, L))
-                    conns.append(corner if k == 0
-                                 else Connector(ConnectorType.STRAIGHT, False))
+                    conns.append(
+                        corner if k == 0 else Connector(ConnectorType.STRAIGHT, False)
+                    )
             # start_heading is the WORLD direction of face 0 (heading of index 0
             # plus 45 deg per direction-index step).
             start_heading = heading + 45.0 * faces[0][0]
@@ -1516,6 +1624,7 @@ class Player9(Player):
                 seeds.append(lp)
         minx, miny, maxx, maxy = room.bounds
         from shapely.geometry import Polygon as _P
+
         min_gate = min(gate_lengths)
         # small-to-medium rectangles at several positions so corridors and
         # separate pockets each get a seed to grow from. size each so a side
@@ -1526,17 +1635,22 @@ class Player9(Player):
         positions.append((rp.x, rp.y))
         for fx in (0.25, 0.5, 0.75):
             for fy in (0.25, 0.5, 0.75):
-                positions.append((minx + (maxx - minx) * fx,
-                                  miny + (maxy - miny) * fy))
+                positions.append((minx + (maxx - minx) * fx, miny + (maxy - miny) * fy))
         for cx, cy in positions:
             for side in (base_side, min(MAX_FACE_LENGTH, base_side * 2)):
                 x0, y0 = cx - side / 2, cy - side / 2
-                rect = _P([(x0, y0), (x0 + side, y0),
-                           (x0 + side, y0 + side), (x0, y0 + side)])
+                rect = _P(
+                    [(x0, y0), (x0 + side, y0), (x0 + side, y0 + side), (x0, y0 + side)]
+                )
                 if room.buffer(TOL).contains(rect):
-                    seeds.append(Loop((x0, y0), 0.0,
-                                      ((0, side), (2, side),
-                                       (4, side), (6, side)), 0.0))
+                    seeds.append(
+                        Loop(
+                            (x0, y0),
+                            0.0,
+                            ((0, side), (2, side), (4, side), (6, side)),
+                            0.0,
+                        )
+                    )
                     break  # one fitting square per position is enough
         # de-duplicate seeds by (start, faces)
         uniq = {}
@@ -1583,20 +1697,29 @@ class Player9(Player):
         n = len(pts)
         if n < 3:
             return None
-        signed = sum(pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
-                     for i in range(n))
+        signed = sum(
+            pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
+            for i in range(n)
+        )
         if signed < 0:
             pts = pts[::-1]
         # in the axis-aligned frame, headings are 0/90/180/270; corner turns are
         # +-90. edges are axis lengths (integer). build corner connectors + edges.
-        hd = [math.degrees(math.atan2(pts[(i + 1) % n][1] - pts[i][1],
-                                      pts[(i + 1) % n][0] - pts[i][0])) % 360
-              for i in range(n)]
+        hd = [
+            math.degrees(
+                math.atan2(
+                    pts[(i + 1) % n][1] - pts[i][1], pts[(i + 1) % n][0] - pts[i][0]
+                )
+            )
+            % 360
+            for i in range(n)
+        ]
         corner_conns = []
         budget = {
             ConnectorType.RIGHT: self.inventory.connectors.get(ConnectorType.RIGHT, 0),
-            ConnectorType.STRAIGHT:
-                self.inventory.connectors.get(ConnectorType.STRAIGHT, 0),
+            ConnectorType.STRAIGHT: self.inventory.connectors.get(
+                ConnectorType.STRAIGHT, 0
+            ),
         }
         for i in range(n):
             turn = (hd[i] - hd[(i - 1) % n] + 180.0) % 360.0 - 180.0
@@ -1641,19 +1764,31 @@ class Player9(Player):
         if n < 3:
             return None
         # CCW winding so turns sum to +360
-        signed = sum(pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
-                     for i in range(n))
+        signed = sum(
+            pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
+            for i in range(n)
+        )
         if signed < 0:
             pts = pts[::-1]
 
-        hd = [math.degrees(math.atan2(pts[(i + 1) % n][1] - pts[i][1],
-                                      pts[(i + 1) % n][0] - pts[i][0])) for i in range(n)]
+        hd = [
+            math.degrees(
+                math.atan2(
+                    pts[(i + 1) % n][1] - pts[i][1], pts[(i + 1) % n][0] - pts[i][0]
+                )
+            )
+            for i in range(n)
+        ]
         # corner connector = turn INTO edge i (at vertex i)
         corner_conns = []
         corner_budget = {
             ConnectorType.RIGHT: self.inventory.connectors.get(ConnectorType.RIGHT, 0),
-            ConnectorType.DIAGONAL: self.inventory.connectors.get(ConnectorType.DIAGONAL, 0),
-            ConnectorType.STRAIGHT: self.inventory.connectors.get(ConnectorType.STRAIGHT, 0),
+            ConnectorType.DIAGONAL: self.inventory.connectors.get(
+                ConnectorType.DIAGONAL, 0
+            ),
+            ConnectorType.STRAIGHT: self.inventory.connectors.get(
+                ConnectorType.STRAIGHT, 0
+            ),
         }
         for i in range(n):
             turn = (hd[i] - hd[(i - 1) % n] + 180.0) % 360.0 - 180.0
@@ -1697,12 +1832,18 @@ class Player9(Player):
         up any wall run longer than 30 with a small inward notch, then build and
         place it. We keep the best size that actually fits our pieces."""
         import time as _t
+
         pts0 = list(self.room.polygon.exterior.coords)[:-1]
         n0 = len(pts0)
         if n0 < 3:
             return None
-        if sum(pts0[i][0] * pts0[(i + 1) % n0][1] - pts0[(i + 1) % n0][0] * pts0[i][1]
-               for i in range(n0)) < 0:
+        if (
+            sum(
+                pts0[i][0] * pts0[(i + 1) % n0][1] - pts0[(i + 1) % n0][0] * pts0[i][1]
+                for i in range(n0)
+            )
+            < 0
+        ):
             pts0 = pts0[::-1]
 
         best = None
@@ -1770,8 +1911,9 @@ class Player9(Player):
 
         verts = []
         for i in range(n):
-            v = inter(lines[(i - 1) % n][0], lines[(i - 1) % n][1],
-                      lines[i][0], lines[i][1])
+            v = inter(
+                lines[(i - 1) % n][0], lines[(i - 1) % n][1], lines[i][0], lines[i][1]
+            )
             if v is None:
                 return None
             verts.append(v)
@@ -1809,11 +1951,13 @@ class Player9(Player):
             for k in range(1, segs):
                 cx, cy = ax + ux * step * k, ay + uy * step * k
                 a1 = (round(cx + nx * DEPTH), round(cy + ny * DEPTH))
-                a2 = (round(cx + ux * DEPTH + nx * DEPTH),
-                      round(cy + uy * DEPTH + ny * DEPTH))
-                out.append((round(cx), round(cy)))          # arrive on the edge
-                out.append(a1)                               # 90-deg turn inward
-                out.append(a2)                               # run forward inside
+                a2 = (
+                    round(cx + ux * DEPTH + nx * DEPTH),
+                    round(cy + uy * DEPTH + ny * DEPTH),
+                )
+                out.append((round(cx), round(cy)))  # arrive on the edge
+                out.append(a1)  # 90-deg turn inward
+                out.append(a2)  # run forward inside
                 out.append((round(cx + ux * DEPTH), round(cy + uy * DEPTH)))
         return out
 
@@ -1849,8 +1993,11 @@ class Player9(Player):
             # from the first so they land on different faces.
             if sum(gates.values()) >= 2 and len(gate_edges) == 1:
                 first = next(iter(gate_edges))
-                cand = [i for i in range(n)
-                        if i not in gate_edges and edge_fits_gate(targets[i])]
+                cand = [
+                    i
+                    for i in range(n)
+                    if i not in gate_edges and edge_fits_gate(targets[i])
+                ]
                 if cand:
                     gate_edges.add(max(cand, key=lambda i: abs(i - first)))
 
@@ -1875,8 +2022,11 @@ class Player9(Player):
                 if L < 5:
                     return None  # never emit a sub-5 piece (would crash Piece)
                 pieces.append(Piece(ptype, L))
-                conns.append(corner_conns[ei] if si == 0
-                             else Connector(ConnectorType.STRAIGHT, False))
+                conns.append(
+                    corner_conns[ei]
+                    if si == 0
+                    else Connector(ConnectorType.STRAIGHT, False)
+                )
         if len(conns) != len(pieces):
             return None
         return pieces, conns
@@ -1892,9 +2042,16 @@ class Player9(Player):
         if want_gate:
             # prefer the gate that leaves the easiest-to-tile remainder; longest
             # first to keep piece count low.
-            gchoice = next((L for L in sorted(gates, reverse=True)
-                            if gates[L] > 0 and 5 <= L <= remaining
-                            and (remaining - L == 0 or remaining - L >= 5)), None)
+            gchoice = next(
+                (
+                    L
+                    for L in sorted(gates, reverse=True)
+                    if gates[L] > 0
+                    and 5 <= L <= remaining
+                    and (remaining - L == 0 or remaining - L >= 5)
+                ),
+                None,
+            )
             if gchoice is None:
                 return None
             gates[gchoice] -= 1
@@ -1941,10 +2098,6 @@ class Player9(Player):
                 gates[L] -= 1
                 out.append((PieceType.GATE, L))
         return out
-
-
-
-
 
     def _l_shape_fallback(self) -> Construction | None:
         """Try L-shaped enclosures oriented to the room's concave corners. Only
