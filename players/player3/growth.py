@@ -1,5 +1,3 @@
-"""Four interleaved, closed growth fronts sharing one physical inventory."""
-
 import math
 import time
 from dataclasses import dataclass, field
@@ -188,12 +186,6 @@ def grow_enclosure(
     use_map=True,
     beam_width=3,
 ):
-    """Round-robin growth, merge on contact outside the common seed.
-
-    All current fronts' union must fit a single inventory before committing a
-    move. Removed internal walls can be reused. Unmerged fronts are alternative
-    finished enclosures; return the highest-scoring validated enclosure found.
-    """
     seed_result = validate_construction(initial, room, inventory)
     seed = seed_result.polygon
     faces = starting_faces(seed, room.polygon, deadline)
@@ -322,8 +314,7 @@ def grow_enclosure(
         shared = unary_union(
             [candidate] + [f.polygon for f in fronts if f is not front]
         )
-        if pack(shared) is None:
-            return None
+        pack(shared)
         return construction
 
     def rank(front, candidate):
