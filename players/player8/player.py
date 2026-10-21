@@ -1,10 +1,12 @@
 """Group 8 player.
 
-Tries a lot of candidate shapes (rectangles, cut-corner octagons and hexagons,
-L/U/T shapes, and grid-traced outlines for big rooms), builds every side out of
-real inventory pieces, fits the shape into the room and keeps the best valid
-one. Every candidate is checked with the simulator's own validator, so we only
-ever return something valid (or None).
+Tries a lot of candidate shapes (grid-traced outlines for big rooms,
+rectangles, cut-corner octagons and hexagons, L/U/T shapes, and everything
+right-angled grown by bumps), builds every side out of real inventory pieces,
+fits the shape into the room and keeps the best valid one. Every candidate is
+checked with the simulator's own validator, so we only ever return something
+valid (or None). Phases are bounded by work, not by the clock, so the result
+does not depend on how fast the machine is.
 """
 
 import bisect
@@ -25,14 +27,20 @@ try:  # a prepared polygon makes the repeated containment tests a lot faster
 except ImportError:
     prep = None
 
-# CPU seconds we give ourselves. The limit is 300, but the submission checker
-# runs with 60, so stay well below that.
-TIME_BUDGET = 50.0
-TEMPLATE_SHARE = 0.4  # first pass over the templates
-GRID_SHARE = 0.7  # grid outlines
-RESUME_SHARE = 0.85  # leftover templates, then random restarts until the end
-
-N_SEEDS = 4  # shapes we try to grow by bumps
+# CPU seconds we give ourselves. The simulator's limit is 300 (the submission
+# checker's 60 s smoke runs only report a timeout as a warning). Every phase is
+# bounded by work, not by the clock, so the same input gives the same answer on
+# any machine; the deadline is a safety net for machines far slower than ours.
+TIME_BUDGET = 280.0
+TEMPLATE_CHECKS = (
+    3_000_000  # containment checks each of the two template passes may spend
+)
+MAX_GRIDS = 150  # grids the outline phase may try (it normally finishes them all)
+# Random restarts keep paying off late (improvements measured at restart
+# 20,000+ on some rooms), so the caps are generous; on this machine a room
+# of restarts runs at 200-400 per second.
+MAX_RESTARTS = 80_000  # random restarts in total ...
+IDLE_RESTARTS = 20_000  # ... and consecutive restarts without an improvement
 MAX_FAILED_MEMO = 400
 MAX_PARTS = 6  # pieces on one face: 30 / 5
 NODE_LIMIT = 4000  # backtracking budget for one allocation
@@ -510,6 +518,7 @@ class Placer:
         padded = room.polygon.buffer(TOL)
         self.checker = prep(padded) if prep is not None else padded
         self.max_radius = self._max_radius()
+        self.checks = 0  # containment tests so far: the template walk's unit of work
 
     def _max_radius(self):
         """Upper bound on the largest circle that fits in the room (sampled on a
@@ -533,6 +542,7 @@ class Placer:
         )
 
     def fits(self, world):
+        self.checks += 1
         minx, miny, maxx, maxy = self.bounds
         for x, y in world:
             if not (
@@ -1465,8 +1475,8 @@ class GridEngine:
         best = best_score
         if self.right < 4:
             return
-        for theta, xc, yc in self.grids():
-            if self.out_of_time():
+        for n_grid, (theta, xc, yc) in enumerate(self.grids()):
+            if n_grid >= MAX_GRIDS or self.out_of_time():
                 return
             grid = self.rasterize(theta, xc, yc)
             if grid is None or not grid.inside:
@@ -1574,9 +1584,11 @@ def _has_pinch(cells):
 
 
 class Player8(Player):
-    """Score-driven search over many enclosure shapes: templates first, then grid
-    outlines, then growing the best right-angled ones by bumps and finally random
-    restarts. Returns the best valid enclosure, or None."""
+    """Score-driven search over many enclosure shapes: grid outlines first (they
+    are cheap and finish on their own), then the templates, growing every
+    right-angled shape found by bumps, and finally random restarts. Each phase
+    is bounded by work rather than by the clock, so the answer does not depend
+    on the machine. Returns the best valid enclosure, or None."""
 
     def build_enclosure(self):
         self.start = time.process_time()
@@ -1591,7 +1603,7 @@ class Player8(Player):
         if not self.alloc.gates:
             self.note = "No gate of length >= 5 in the inventory, nothing valid exists"
             return None
-        self.placer = Placer(self.room, self._out_of_time)
+        self.placer = Placer(self.room, self._done)
         self.best_score = 0.0
         self.best = None
         self.best_desc = ""
@@ -1599,23 +1611,24 @@ class Player8(Player):
         self.gate_counts = [2, 1] if two_gates else [1]
         self.alloc.borrow_for_single = not two_gates
         self.seeds = []  # right-angled enclosures to grow from, best first
+        self._refined = set()  # seeds that have already been grown
         self._cands = None  # template candidates, worked through in order
         self._next = 0
+        self._restarts = 0
+        self.upper_bound = self._upper_bound()
 
         try:
-            self.deadline = TIME_BUDGET * TEMPLATE_SHARE
-            self._templates()
-            self.deadline = TIME_BUDGET * GRID_SHARE
+            # grid outlines first: cheap, and they finish on their own
             engine = GridEngine(
-                self.placer, self.alloc, self.conn, self.weights, self._out_of_time
+                self.placer, self.alloc, self.conn, self.weights, self._done
             )
             engine.run(self._try_grid_shape, self.best_score)
-            self.deadline = TIME_BUDGET
             self._refine()
-            # whatever templates the first pass had no time for
-            self.deadline = TIME_BUDGET * RESUME_SHARE
-            self._templates()
-            self.deadline = TIME_BUDGET
+            self._templates(TEMPLATE_CHECKS)
+            self._refine()
+            # whatever templates the first pass did not get to
+            self._templates(TEMPLATE_CHECKS)
+            self._refine()
             self._explore()
         except Exception as e:  # noqa: BLE001 - keep what we have, don't crash the run
             self.note = f"search stopped early ({type(e).__name__}: {e})"
@@ -1625,12 +1638,32 @@ class Player8(Player):
             return None
         self.note = (
             f"{self.best_desc}, expected score {self.best_score:.1f} "
-            f"(cpu {time.process_time() - self.start:.1f}s)"
+            f"(cpu {time.process_time() - self.start:.1f}s, "
+            f"{self.placer.checks} checks, {self._restarts} restarts"
+            f"{', at the upper bound' if self._at_bound() else ''})"
         )
         return self.best
 
     def _out_of_time(self):
         return time.process_time() - self.start > self.deadline
+
+    def _at_bound(self):
+        return self.best_score >= self.upper_bound - 1e-6
+
+    def _done(self):
+        """Stop searching: the safety-net deadline has passed, or nothing can
+        beat what we have."""
+        return self._at_bound() or self._out_of_time()
+
+    def _upper_bound(self):
+        """No enclosure can score more than this: its area is at most the
+        room's and at most what the pieces' total length can enclose
+        (isoperimetric), its perimeter is charged nothing, and the second-gate
+        bonus is assumed whenever two gates exist."""
+        w = self.weights
+        total = sum(n * k for n, k in self.alloc.pool.counts.items())
+        area = min(self.room.polygon.area, total * total / (4 * math.pi))
+        return 1000.0 + w.A * area + (w.G if len(self.gate_counts) > 1 else 0.0)
 
     def _score(self, area, perimeter, bonus):
         w = self.weights
@@ -1652,10 +1685,9 @@ class Player8(Player):
         if not result.valid:
             return 0.0, False, result.reason
         score = score_construction(result, self.weights)
-        if shape.axis_only:
+        if shape.axis_only and "grown" not in desc:
             self.seeds.append((score, shape, theta, tx, ty))
             self.seeds.sort(key=lambda t: -t[0])
-            del self.seeds[N_SEEDS * 3 :]
         if score > self.best_score:
             self.best_score = score
             self.best = construction
@@ -1782,20 +1814,22 @@ class Player8(Player):
         out.sort(key=lambda t: -t[0])
         return out
 
-    def _templates(self):
-        """Work through the candidates, best upper bound first. If time runs out
-        we remember where we stopped so a later call can carry on."""
+    def _templates(self, work):
+        """Work through the candidates, best upper bound first, until `work`
+        containment checks have been spent. We remember where we stopped so a
+        later call can carry on."""
         if self._cands is None:
             self._cands = self._template_candidates()
             self._next = 0
             self._failed = {}  # family -> parameter sets that didn't fit anywhere
+        spent = self.placer.checks
         while self._next < len(self._cands):
             bound, family, params = self._cands[self._next]
             if bound <= self.best_score:
                 # sorted, so nothing left can win
                 self._next = len(self._cands)
                 return
-            if self._out_of_time():
+            if self._done() or self.placer.checks - spent > work:
                 return
             self._next += 1
             # a rectangle fits the same either way round
@@ -1823,7 +1857,7 @@ class Player8(Player):
                     placed = True
                     placement = self.placer.place(shape)
                 if placement is None:
-                    if self._out_of_time():
+                    if self._done():
                         self._next -= 1  # ran out of time, not a real miss
                         return
                     misses = self._failed.setdefault(family, [])
@@ -1849,16 +1883,14 @@ class Player8(Player):
             self._side_lengths(),
             self.weights,
             self.conn["right"],
-            self._out_of_time,
+            self._done,
         )
-        starts, seen = [], set()
-        for item in self.seeds:
-            key = (item[1].family, tuple(item[1].lengths))
-            if key not in seen:
-                seen.add(key)
-                starts.append(item)
-        for _, shape, theta, tx, ty in starts[:N_SEEDS]:
-            if self._out_of_time():
+        for _, shape, theta, tx, ty in list(self.seeds):
+            key = (shape.family, tuple(shape.lengths))
+            if key in self._refined:
+                continue
+            self._refined.add(key)
+            if self._done():
                 return
             self._grow(refiner, shape, theta, tx, ty)
 
@@ -1869,7 +1901,7 @@ class Player8(Player):
         for grown, th, gx, gy in refiner.refine(
             shape, theta, tx, ty, rng=rng, top_k=top_k
         ):
-            if self._out_of_time():
+            if self._done():
                 return False
             if not self._connectors_ok(grown):
                 break
@@ -1899,22 +1931,27 @@ class Player8(Player):
         return None
 
     def _explore(self):
-        """Spend the time that is left on random restarts: drop a small square
-        somewhere, then grow it by randomly chosen bumps. One greedy growth gets
-        stuck in a single local optimum; different growth orders find the
-        winding shapes (star arms, letter strokes) it misses."""
-        if self.conn["right"] < 6 or self._out_of_time():
+        """Random restarts: drop a small square somewhere, then grow it by
+        randomly chosen bumps. One greedy growth gets stuck in a single local
+        optimum; different growth orders find the winding shapes (star arms,
+        letter strokes) it misses. Stops after MAX_RESTARTS, or after
+        IDLE_RESTARTS in a row that did not improve the best score."""
+        if self.conn["right"] < 6 or self._done():
             return
         lengths = self._side_lengths()
         if not lengths:
             return
         rng = random.Random(8)
         refiner = Refiner(
-            self.placer, lengths, self.weights, self.conn["right"], self._out_of_time
+            self.placer, lengths, self.weights, self.conn["right"], self._done
         )
         angles = sorted({round(a % 90.0, 4) for a in self.placer.out_angle}) or [0.0]
-        misses = 0
-        while not self._out_of_time():
+        misses = idle = 0
+        while (
+            not self._done() and self._restarts < MAX_RESTARTS and idle < IDLE_RESTARTS
+        ):
+            self._restarts += 1
+            before = self.best_score
             start = self._random_start(rng, lengths[:4], angles)
             if start is None:
                 # no square fits (tight room): grow from something we already have
@@ -1926,3 +1963,4 @@ class Player8(Player):
                 _, *start = rng.choice(self.seeds)
             if not self._grow(refiner, *start, rng=rng, top_k=rng.choice((2, 3, 5))):
                 return
+            idle = 0 if self.best_score > before else idle + 1
