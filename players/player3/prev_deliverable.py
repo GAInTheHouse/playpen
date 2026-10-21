@@ -18,7 +18,7 @@ from .placement import rectangle_seeds
 
 class Player3(Player):
     # One CPU deadline shared by seeding, beam search, and mapped growth.
-    SEARCH_SECONDS = 150.0
+    SEARCH_SECONDS = 250.0
     RECTANGLE_CANDIDATES = 2000
     EXPANSIONS_PER_START = 128
     BEAM_WIDTH = 24
