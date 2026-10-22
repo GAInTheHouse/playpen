@@ -105,6 +105,13 @@ A scenario is a JSON file: `room` (polygon corners), `inventory`, `weights`.
 | `tournament/scenarios/6.json` | A tight L-shaped room (23 x 21) with 11 pieces of different lengths and only 6 right-angle connectors. Exactly one enclosure is valid: the L that fills the room. |
 | `scenarios/players/player1/` ... `player10/` | One folder per group for its own test scenarios. Each holds a `.gitkeep` so git keeps the empty folder. |
 
+## `tournament/`
+
+| File | What it is |
+| :-- | :-- |
+| `tournament/run_tournament.py` | Runs players on scenarios and writes one CSV row per run (player, scenario, score, validity, area, CPU time, ...). Every run is its own process, with a CPU limit and a real-time limit. Groups use it to try their own player; you use it for the real tournament. |
+| `tournament/scenarios/` | The tournament's rooms, `1a.json` ... `6.json` (listed in the `scenarios/` table below). |
+
 ## `scripts/`
 
 | File | What it is |
@@ -127,6 +134,7 @@ stand-ins, so a broken group player can't turn the simulator's tests red.
 | `tests/test_submissions.py` | Finding group players, the ownership rules, the submission checker. |
 | `tests/test_gui_layout.py` | The GUI: no overlapping text, nothing clipped at several window sizes, hover tooltips, the score panel. Needs a display. |
 | `tests/test_gui_inventory.py` | The GUI's inventory box (every item listed, used ones highlighted, scrolling), the red negative score, and the panel scrolling on a short screen. Needs a display. |
+| `tests/test_tournament.py` | The tournament runner: which scenarios and players it picks, the CSV rows, crashes and stuck players, resuming, the summary. Runs only the example player. |
 | `tests/test_placement_guide.py` | Runs every code block in `PLACEMENT_GUIDE.md` and checks the numbers it claims; checks the docs only name files that exist, and that this file lists every file. |
 | `tests/__init__.py` | Empty; makes `tests` a package. |
 
